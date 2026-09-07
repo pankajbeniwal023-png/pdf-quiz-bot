@@ -29,7 +29,7 @@ QUESTION_BANK = []
 ASKED_QUESTION_IDS = set()
 POLL_TRACKER = {}
 
-# --- Gemini Rephraser Engine (Updated Active Model) ---
+# --- Gemini Rephraser Engine (Updated Model: gemini-3.6-flash) ---
 async def rephrase_question_with_ai(original_q: dict, mode: str):
     orig_question = original_q.get("question", "")
     orig_options = original_q.get("options", [])
@@ -86,7 +86,7 @@ async def rephrase_question_with_ai(original_q: dict, mode: str):
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.0-flash',  # 404 Not Found एरर फिक्स करने के लिए वर्किंग मॉडल
+            model='gemini-3.6-flash',  # <--- अपडेटेड मॉडल नाम
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
