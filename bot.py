@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import logging
 import asyncio
@@ -14,8 +13,6 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-import pdfplumber
-import pypdf
 from google import genai
 from google.genai import types
 
@@ -35,47 +32,16 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Helper: डबल-सुरक्षा के साथ PDF से टेक्स्ट निकालना ---
-def extract_text_from_pdf(pdf_bytes):
-    extracted_text = ""
-    
-    # तरीका 1: pdfplumber कोशिश करेगा
-    try:
-        pdf_file = io.BytesIO(pdf_bytes)
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    extracted_text += t + "\n"
-        if extracted_text.strip():
-            return extracted_text.strip()
-    except Exception as e:
-        logger.warning(f"pdfplumber failed: {e}, falling back to pypdf...")
-
-    # तरीका 2: अगर pdfplumber फेल हुआ तो pypdf कोशिश करेगा
-    try:
-        pdf_file = io.BytesIO(pdf_bytes)
-        reader = pypdf.PdfReader(pdf_file)
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                extracted_text += t + "\n"
-        return extracted_text.strip()
-    except Exception as e:
-        logger.error(f"pypdf fallback failed as well: {e}")
-        return ""
-
-# --- Helper: Gemini AI से सवाल बनवाना ---
-async def generate_quiz_from_text(pdf_text: str, num_questions: int):
+# --- Helper: Gemini AI (Direct PDF/Image Read) से सवाल बनवाना ---
+async def generate_quiz_from_pdf_bytes(pdf_bytes: bytes, file_name: str, num_questions: int):
     prompt = f"""
 तुम एक बहुत ही सख्त प्रतियोगी परीक्षा विशेषज्ञ हो।
-नीचे दिए गए टेक्स्ट को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) हिंदी में तैयार करो।
+इस अपलोड की गई PDF/इमेज फाइल को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) हिंदी में तैयार करो।
 
 **सख्त नियम:**
-1. उत्तर केवल और केवल नीचे दिए गए टेक्स्ट में मौजूद तथ्यों पर आधारित होने चाहिए। अपने मन या बाहर के ज्ञान से कोई उत्तर मत देना।
-2. प्रश्नों का तरीका और भाषा हर बार अलग और नई होनी चाहिए ताकि बेहतरीन रिवीजन हो।
-3. प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
-4. आउटपुट केवल और केवल शुद्ध JSON एरे (Array) में होना चाहिए।
+1. उत्तर केवल और केवल इस फ़ाइल/इमेज में मौजूद सामग्री पर आधारित होने चाहिए।
+2. प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
+3. आउटपुट केवल और केवल शुद्ध JSON एरे (Array) में होना चाहिए।
 
 JSON प्रारूप:
 [
@@ -87,14 +53,18 @@ JSON प्रारूप:
 ]
 
 ध्यान दें: "answer" का मान 0 से 3 तक का इंडेक्स होना चाहिए।
-
-टेक्स्ट सामग्री:
-{pdf_text[:12000]}  
 """
     try:
-        response = ai_client.models.generate_content(
+        # PDF की बाइट्स को सीधे Gemini Multimodal Input की तरह भेजना
+        pdf_part = types.Part.from_bytes(
+            data=pdf_bytes,
+            mime_type="application/pdf",
+        )
+
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
             model='gemini-2.5-flash',
-            contents=prompt,
+            contents=[pdf_part, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.7,
@@ -103,7 +73,7 @@ JSON प्रारूप:
         data = json.loads(response.text)
         return data
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini Multimodal API error: {e}", exc_info=True)
         return None
 
 # --- बॉट कमांड्स ---
@@ -115,9 +85,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         "👋 **PDF Quiz Generator Bot में आपका स्वागत है!**\n\n"
         "📖 **इस्तेमाल कैसे करें:**\n"
-        "1. अपनी कोई भी **PDF फाइल** यहाँ भेजें।\n"
+        "1. अपनी कोई भी **PDF फ़ाइल / स्कैन दस्तावेज़** यहाँ भेजें।\n"
         "2. नीचे दिए गए बटन से चुनें कि कितने सवाल हल करने हैं।\n"
-        "3. बॉट आपकी PDF से ताज़ा सवाल बनाकर टेस्ट शुरू कर देगा!"
+        "3. बॉट AI के ज़रिए फ़ाइल को समझकर तुरंत टेस्ट शुरू कर देगा!"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
 
@@ -126,20 +96,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc.file_name.lower().endswith('.pdf'):
         return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF लोड हो रही है और टेक्स्ट निकाला जा रहा है...")
+    msg = await update.message.reply_text("📥 PDF डाउनलोड और प्रोसेस हो रही है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
-        
-        # Async में ब्लोकिंग कोड चलाएं ताकि बॉट हैंग न हो
-        pdf_text = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
-
-        if not pdf_text or len(pdf_text) < 20:
-            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका। (हो सकता है यह केवल फोटो/स्कैन की गई PDF हो)।")
 
         user_id = update.effective_user.id
-        USER_PDF_DATA[user_id] = {"text": pdf_text, "filename": doc.file_name}
+        USER_PDF_DATA[user_id] = {
+            "bytes": bytes(pdf_bytes),
+            "filename": doc.file_name
+        }
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10")],
@@ -155,7 +122,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"PDF Handling Error: {e}", exc_info=True)
-        await msg.edit_text("❌ PDF प्रोसेस करने में त्रुटि हुई। कृपया छोटी या सही फॉर्मेट वाली PDF भेजें।")
+        await msg.edit_text("❌ PDF लोड करने में त्रुटि हुई। कृपया फिर से प्रयास करें।")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -168,16 +135,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("gen_"):
         num_qs = int(data.split("_")[1])
         
-        if user_id not in USER_PDF_DATA or "text" not in USER_PDF_DATA[user_id]:
+        if user_id not in USER_PDF_DATA or "bytes" not in USER_PDF_DATA[user_id]:
             return await query.edit_message_text("❌ PDF का डेटा नहीं मिला। कृपया फिर से PDF भेजें: /start")
 
-        pdf_text = USER_PDF_DATA[user_id]["text"]
-        await query.edit_message_text(f"🤖 AI आपकी PDF से {num_qs} नए सवाल बना रहा है... ⏳")
+        pdf_bytes = USER_PDF_DATA[user_id]["bytes"]
+        file_name = USER_PDF_DATA[user_id]["filename"]
+        
+        await query.edit_message_text(f"🤖 Gemini AI आपकी स्कैन/इमेज PDF को पढ़ रहा है और {num_qs} सवाल बना रहा है... ⏳")
 
-        quiz_data = await generate_quiz_from_text(pdf_text, num_qs)
+        quiz_data = await generate_quiz_from_pdf_bytes(pdf_bytes, file_name, num_qs)
 
         if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया बटन पर फिर से क्लिक करें।")
+            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया बटन पर फिर से क्लिक करें या छोटी PDF भेजें।")
 
         context.user_data.clear()
         context.user_data.update({
