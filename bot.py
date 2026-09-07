@@ -32,7 +32,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Helper: Gemini AI (Direct PDF/Image Read) से सवाल बनवाना ---
+# --- Helper: Gemini AI से सवाल बनवाना ---
 async def generate_quiz_from_pdf_bytes(pdf_bytes: bytes, file_name: str, num_questions: int):
     prompt = f"""
 तुम एक बहुत ही सख्त प्रतियोगी परीक्षा विशेषज्ञ हो।
@@ -55,7 +55,7 @@ JSON प्रारूप:
 ध्यान दें: "answer" का मान 0 से 3 तक का इंडेक्स होना चाहिए।
 """
     try:
-        # PDF की बाइट्स को सीधे Gemini Multimodal Input की तरह भेजना
+        # PDF बाइट्स को सपोर्टेड MIME टाइप के साथ भेजना
         pdf_part = types.Part.from_bytes(
             data=pdf_bytes,
             mime_type="application/pdf",
@@ -63,7 +63,7 @@ JSON प्रारूप:
 
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.5-flash',
+            model='gemini-1.5-flash',
             contents=[pdf_part, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -73,7 +73,7 @@ JSON प्रारूप:
         data = json.loads(response.text)
         return data
     except Exception as e:
-        logger.error(f"Gemini Multimodal API error: {e}", exc_info=True)
+        logger.error(f"Gemini API error: {e}", exc_info=True)
         return None
 
 # --- बॉट कमांड्स ---
@@ -141,7 +141,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_bytes = USER_PDF_DATA[user_id]["bytes"]
         file_name = USER_PDF_DATA[user_id]["filename"]
         
-        await query.edit_message_text(f"🤖 Gemini AI आपकी स्कैन/इमेज PDF को पढ़ रहा है और {num_qs} सवाल बना रहा है... ⏳")
+        await query.edit_message_text(f"🤖 Gemini AI आपकी PDF को पढ़ रहा है और {num_qs} सवाल बना रहा है... ⏳")
 
         quiz_data = await generate_quiz_from_pdf_bytes(pdf_bytes, file_name, num_qs)
 
