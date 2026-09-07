@@ -3,19 +3,16 @@ import json
 import logging
 import asyncio
 import random
+import re
 from aiohttp import web
 from telegram import Update, Poll
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    PollAnswerHandler,
-    MessageHandler,
-    filters,
-    ContextTypes
+    Application, CommandHandler, PollAnswerHandler, MessageHandler, filters, ContextTypes
 )
 from google import genai
 from google.genai import types
 
+# लॉगिंग सेटिंग्स
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -25,276 +22,173 @@ RENDER_URL = os.environ.get("RENDER_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Global Data Banks
-PROCESSED_DATA = {
-    "direct": [],
-    "statement": [],
-    "twisted": []
-}
+# डेटा स्टोर करने के लिए
+PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
 ASKED_IDS = set()
 POLL_TRACKER = {}
 
-# Batch generator to process uploaded JSON in bulk
-async def process_all_questions_in_bulk(raw_questions: list):
+async def process_questions_with_ai(chunk):
+    """AI को निर्देश: भाषा बदलो और विश्लेषणात्मक बनाओ"""
     prompt = f"""
-You are an expert exam setter. Convert the provided array of quiz items into two new formats:
-1. "statement": Assertion-Reason style ("कथन (A): ... \nकारण (R): ...").
-2. "twisted": Rephrased analytical question with new sentence structure.
+    आप एक विशेषज्ञ परीक्षा प्रश्न पत्र निर्माता हैं। इन प्रश्नों को देवनागरी हिंदी में रूपांतरित करें:
+    
+    1. "statement": इसमें 'कथन और कारण' (Assertion-Reason) वाले प्रश्न बनाएं। भाषा कठिन और उच्च स्तरीय रखें।
+    2. "twisted": इसमें प्रश्न की भाषा को पूरी तरह बदल दें (Rephrase)। शब्दावली ऐसी रखें कि छात्र को रट्टा मारने के बजाय सोचकर उत्तर देना पड़े।
+    
+    नियम:
+    - भाषा केवल देवनागरी हिंदी होनी चाहिए।
+    - हर प्रश्न में नए पर्यायवाची शब्दों का प्रयोग करें।
+    - उत्तर का 'index' (answer) मूल डेटा जैसा ही रहना चाहिए।
+    - केवल शुद्ध JSON एरे (Array) ही वापस भेजें।
 
-Input Data:
-{json.dumps(raw_questions, ensure_ascii=False)}
-
-Rules:
-- Keep the correct option matching the original index.
-- Output strictly valid JSON with this exact array structure:
-[
-  {{
-    "id": 0,
-    "direct": {{"question": "...", "options": [...], "answer": 0}},
-    "statement": {{"question": "...", "options": [...], "answer": 0}},
-    "twisted": {{"question": "...", "options": [...], "answer": 0}}
-  }}
-]
-"""
+    डेटा:
+    {json.dumps(chunk, ensure_ascii=False)}
+    """
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash', 
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.7,
+                temperature=1.0, # अधिकतम विविधता के लिए
             ),
         )
-        parsed = json.loads(response.text.strip())
-        return parsed
+        # JSON निकालने का सुरक्षित तरीका
+        text = response.text.strip()
+        if "```json" in text:
+            text = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL).group(1)
+        return json.loads(text)
     except Exception as e:
-        logger.error(f"Bulk Generation Error: {e}")
-        # Fallback to direct raw format if API fails during processing
-        fallback = []
-        for i, q in enumerate(raw_questions):
-            fallback.append({
-                "id": i,
-                "direct": q,
-                "statement": q,
-                "twisted": q
-            })
-        return fallback
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🧠 **Ultra-Fast Quiz Bot**\n\n"
-        "1. `.json` या `.txt` फ़ाइल भेजें (अपलोड के समय ही AI सारे वेरिएशन्स तैयार कर लेगा)।\n"
-        "2. फिर बिना किसी देरी के तुरंत क्विज़ खेलें:\n\n"
-        "📌 `/quiz 10` - डायरेक्ट सवाल\n"
-        "📝 `/statement 10` - कथन-कारण सवाल\n"
-        "🔄 `/twisted 10` - घुमावदार सवाल\n"
-        "🧹 `/reset` - हिस्ट्री साफ़ करें"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        logger.error(f"AI Error: {e}")
+        # फेल होने पर मूल सवाल ही वापस भेजें
+        return [{"direct": q, "statement": q, "twisted": q} for q in chunk]
 
 async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROCESSED_DATA, ASKED_IDS
     doc = update.message.document
-    file_name = doc.file_name.lower()
-    
-    if not (file_name.endswith('.json') or file_name.endswith('.txt')):
-        return await update.message.reply_text("❌ केवल .json या .txt फ़ाइल भेजें।")
+    if not doc.file_name.lower().endswith(('.json', '.txt')):
+        return await update.message.reply_text("❌ कृपया केवल .json या .txt फाइल भेजें।")
 
-    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई। AI सभी फॉर्मेट तैयार कर रहा है, कृपया प्रतीक्षा करें... ⚡")
-    
+    status = await update.message.reply_text("⏳ AI आपके लिए नए और कठिन प्रश्न तैयार कर रहा है... इसमें कुछ समय लग सकता है।")
+
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
-        text_data = content.decode('utf-8').strip()
-        data = json.loads(text_data)
+        data = json.loads(content.decode('utf-8'))
 
-        if isinstance(data, list) and len(data) > 0:
-            bulk_processed = await process_all_questions_in_bulk(data)
+        # पुरानी याददाश्त साफ़ करें
+        PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
+        ASKED_IDS.clear()
+
+        # 5-5 सवालों के टुकड़ों में प्रोसेस करना (ताकि कभी फेल न हो)
+        batch_size = 5
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i+batch_size]
+            await status.edit_text(f"🔄 प्रगति: {i}/{len(data)} प्रश्न तैयार हो चुके हैं...")
+            results = await process_questions_with_ai(batch)
             
-            PROCESSED_DATA["direct"] = [item["direct"] for item in bulk_processed]
-            PROCESSED_DATA["statement"] = [item["statement"] for item in bulk_processed]
-            PROCESSED_DATA["twisted"] = [item["twisted"] for item in bulk_processed]
-            
-            ASKED_IDS.clear()
-            
-            await status_msg.edit_text(
-                f"✅ **{len(data)} सवाल लोड हो गए!**\n\n"
-                "अब कमांड देते ही बिना किसी टाइम-लैग के क्विज़ चालू होगा:\n"
-                "👉 `/statement 5` या `/twisted 5` टाइप करें।", 
-                parse_mode="Markdown"
-            )
-        else:
-            await status_msg.edit_text("❌ फ़ाइल में वैलिड प्रश्न लिस्ट नहीं है।")
+            for res in results:
+                PROCESSED_DATA["direct"].append(res.get("direct", res))
+                PROCESSED_DATA["statement"].append(res.get("statement", res))
+                PROCESSED_DATA["twisted"].append(res.get("twisted", res))
+
+        await status.edit_text("✅ **तैयारी पूरी हुई!**\nअब आप रट्टा नहीं मार पाएंगे।\n\nकमांड्स:\n/quiz - सामान्य\n/statement - कथन/कारण\n/twisted - घुमावदार भाषा")
     except Exception as e:
-        logger.error(f"File handling error: {e}")
-        await status_msg.edit_text("❌ फ़ाइल रीड या प्रोसेस करने में एरर आई।")
+        await status.edit_text(f"❌ फाइल प्रोसेसिंग में त्रुटि: {e}")
 
 async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    global PROCESSED_DATA, ASKED_IDS
     bank = PROCESSED_DATA.get(mode, [])
+    if not bank: return await update.message.reply_text("❌ पहले फाइल अपलोड करें!")
+
+    available = [i for i in range(len(bank)) if i not in ASKED_IDS]
+    if not available: return await update.message.reply_text("🎉 सभी प्रश्न समाप्त! /reset करें।")
+
+    count = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
+    selected_indices = random.sample(available, min(count, len(available)))
     
-    if not bank:
-        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली फ़ाइल अपलोड करें!")
-
-    unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
-
-    if not unasked_indices:
-        return await update.message.reply_text(
-            "🎉 **सभी सवाल समाप्त हो चुके हैं!**\n"
-            "पुनः शुरू करने के लिए `/reset` करें।"
-        )
-
-    count = 5
-    if context.args and context.args[0].isdigit():
-        count = int(context.args[0])
-
-    selected_indices = random.sample(unasked_indices, min(count, len(unasked_indices)))
-    
-    session_questions = []
-    for idx in selected_indices:
-        ASKED_IDS.add(idx)
-        session_questions.append(bank[idx])
+    quiz_queue = [bank[i] for i in selected_indices]
+    random.shuffle(quiz_queue)
 
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    context.application.user_data[user_id] = {
+        "quiz": quiz_queue, "idx": 0, "score": 0, "total": len(quiz_queue), "busy": True
+    }
+    await send_next_poll(context, update.effective_chat.id, user_id)
 
-    context.user_data.clear()
-    context.user_data.update({
-        "quiz": session_questions,
-        "idx": 0,
-        "score": 0,
-        "total": len(session_questions),
-        "busy": True
-    })
-
-    await send_next_quiz(context, chat_id, user_id)
-
-async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="direct")
-
-async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="statement")
-
-async def twisted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="twisted")
-
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ASKED_IDS
-    ASKED_IDS.clear()
-    await update.message.reply_text("🧹 **हिस्ट्री रीसेट कर दी गई है!**")
-
-async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    user_data = context.application.user_data.get(user_id)
-    if not user_data or not user_data.get("busy"):
+async def send_next_poll(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    ud = context.application.user_data.get(user_id)
+    if not ud or ud["idx"] >= ud["total"]:
+        if ud: await context.bot.send_message(chat_id, f"🏁 **क्विज़ समाप्त!**\nआपका स्कोर: {ud['score']}/{ud['total']}")
         return
 
-    idx = user_data.get("idx", 0)
-    quiz = user_data.get("quiz", [])
-    total = user_data.get("total", 0)
-
-    if idx >= total:
-        score = user_data.get("score", 0)
-        per = int((score / total) * 100) if total > 0 else 0
-        remaining = len(PROCESSED_DATA["direct"]) - len(ASKED_IDS)
-        res = (
-            f"🎉 **क्विज़ पूरा हुआ!**\n\n"
-            f"✅ सही उत्तर: {score} / {total}\n"
-            f"📊 स्कोर: {per}%\n"
-            f"📚 शेष नए सवाल: {remaining}"
-        )
-        await context.bot.send_message(chat_id, res, parse_mode="Markdown")
-        user_data["busy"] = False
-        return
-
-    q = quiz[idx]
-    q_text = f"Q{idx + 1}/{total}. {q['question']}"
-    options = q['options']
-    correct_id = q['answer']
+    q = ud["quiz"][ud["idx"]]
+    
+    # विकल्पों को आपस में बदलना (Shuffling Options)
+    opts = list(enumerate(q['options']))
+    random.shuffle(opts)
+    
+    new_labels = [o[1] for o in opts]
+    new_ans_id = next(i for i, o in enumerate(opts) if o[0] == q['answer'])
 
     msg = await context.bot.send_poll(
         chat_id=chat_id,
-        question=q_text[:300],  # Max limit for telegram question text
-        options=[opt[:100] for opt in options], # Max limit for options text
+        question=f"प्रश्न {ud['idx']+1}: {q['question']}"[:300],
+        options=[o[:100] for o in new_labels],
         type=Poll.QUIZ,
-        correct_option_id=correct_id,
+        correct_option_id=new_ans_id,
         is_anonymous=False
     )
-
-    user_data["idx"] = idx + 1
-    POLL_TRACKER[msg.poll.id] = {
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "correct_option_id": correct_id
-    }
+    POLL_TRACKER[msg.poll.id] = {"uid": user_id, "cid": chat_id, "ans": new_ans_id}
+    ud["idx"] += 1
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    poll_answer = update.poll_answer
-    poll_id = poll_answer.poll_id
+    pa = update.poll_answer
+    if pa.poll_id not in POLL_TRACKER: return
+    
+    track = POLL_TRACKER.pop(pa.poll_id)
+    ud = context.application.user_data.get(track["uid"])
+    if ud and ud["busy"]:
+        if pa.option_ids[0] == track["ans"]: ud["score"] += 1
+        await send_next_poll(context, track["cid"], track["uid"])
 
-    if poll_id not in POLL_TRACKER:
-        return
-
-    tracker = POLL_TRACKER.pop(poll_id)
-    user_id = tracker["user_id"]
-    chat_id = tracker["chat_id"]
-    correct_option_id = tracker["correct_option_id"]
-
-    if not poll_answer.option_ids:
-        return
-
-    selected = poll_answer.option_ids[0]
-    user_data = context.application.user_data.get(user_id)
-
-    if user_data and user_data.get("busy"):
-        if selected == correct_option_id:
-            user_data["score"] += 1
-        await send_next_quiz(context, chat_id, user_id)
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ASKED_IDS.clear()
+    await update.message.reply_text("🧹 इतिहास मिटा दिया गया है!")
 
 async def main():
-    ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("नमस्ते! फाइल भेजें।")))
+    app.add_handler(CommandHandler("quiz", lambda u,c: start_quiz_session(u,c,"direct")))
+    app.add_handler(CommandHandler("statement", lambda u,c: start_quiz_session(u,c,"statement")))
+    app.add_handler(CommandHandler("twisted", lambda u,c: start_quiz_session(u,c,"twisted")))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("quiz", quiz_cmd))
-    ptb_app.add_handler(CommandHandler("statement", statement_cmd))
-    ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
-    ptb_app.add_handler(CommandHandler("reset", reset_cmd))
-    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
-    ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
-
-    await ptb_app.initialize()
-    await ptb_app.start()
-
+    await app.initialize()
+    await app.start()
+    
     webhook_url = f"{RENDER_URL}/{TOKEN}"
-    await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-
+    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    
     web_app = web.Application()
-
-    async def telegram_webhook(request):
-        try:
-            data = await request.json()
-            update = Update.de_json(data, ptb_app.bot)
-            await ptb_app.process_update(update)
-        except Exception as e:
-            logger.error(f"Error: {e}")
-        return web.Response(text="OK")
-
-    async def health_check(request):
-        return web.Response(text="Bot Alive")
-
-    web_app.router.add_post(f"/{TOKEN}", telegram_webhook)
-    web_app.router.add_get("/", health_check)
-
-    port = int(os.environ.get("PORT", 10000))
+    web_app.router.add_post(f"/{TOKEN}", lambda r: telegram_webhook(r, app))
+    web_app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+    
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
     await asyncio.Event().wait()
 
-if __name__ == '__main__':
+async def telegram_webhook(request, app):
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+    except Exception as e: logger.error(f"Webhook Error: {e}")
+    return web.Response(text="OK")
+
+if __name__ == '__main__':
+    asyncio.run(main())
