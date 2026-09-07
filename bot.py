@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes
 )
 import pdfplumber
+import pypdf
 from google import genai
 from google.genai import types
 
@@ -34,16 +35,35 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Helper: pdfplumber से सटीक टेक्स्ट निकालना ---
+# --- Helper: डबल-सुरक्षा के साथ PDF से टेक्स्ट निकालना ---
 def extract_text_from_pdf(pdf_bytes):
-    pdf_file = io.BytesIO(pdf_bytes)
     extracted_text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
+    
+    # तरीका 1: pdfplumber कोशिश करेगा
+    try:
+        pdf_file = io.BytesIO(pdf_bytes)
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    extracted_text += t + "\n"
+        if extracted_text.strip():
+            return extracted_text.strip()
+    except Exception as e:
+        logger.warning(f"pdfplumber failed: {e}, falling back to pypdf...")
+
+    # तरीका 2: अगर pdfplumber फेल हुआ तो pypdf कोशिश करेगा
+    try:
+        pdf_file = io.BytesIO(pdf_bytes)
+        reader = pypdf.PdfReader(pdf_file)
+        for page in reader.pages:
             t = page.extract_text()
             if t:
                 extracted_text += t + "\n"
-    return extracted_text.strip()
+        return extracted_text.strip()
+    except Exception as e:
+        logger.error(f"pypdf fallback failed as well: {e}")
+        return ""
 
 # --- Helper: Gemini AI से सवाल बनवाना ---
 async def generate_quiz_from_text(pdf_text: str, num_questions: int):
@@ -103,18 +123,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc.file_name.endswith('.pdf'):
+    if not doc.file_name.lower().endswith('.pdf'):
         return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF डाउनलोड हो रही है और टेक्स्ट निकाला जा रहा है...")
+    msg = await update.message.reply_text("📥 PDF लोड हो रही है और टेक्स्ट निकाला जा रहा है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
-        pdf_text = extract_text_from_pdf(pdf_bytes)
+        
+        # Async में ब्लोकिंग कोड चलाएं ताकि बॉट हैंग न हो
+        pdf_text = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
 
-        if not pdf_text or len(pdf_text) < 30:
-            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका। (यह पूरी तरह इमेज-बेस्ड या स्कैन की हुई हो सकती है)।")
+        if not pdf_text or len(pdf_text) < 20:
+            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका। (हो सकता है यह केवल फोटो/स्कैन की गई PDF हो)।")
 
         user_id = update.effective_user.id
         USER_PDF_DATA[user_id] = {"text": pdf_text, "filename": doc.file_name}
@@ -132,8 +154,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"PDF error: {e}")
-        await msg.edit_text("❌ PDF प्रोसेस करने में त्रुटि हुई।")
+        logger.error(f"PDF Handling Error: {e}", exc_info=True)
+        await msg.edit_text("❌ PDF प्रोसेस करने में त्रुटि हुई। कृपया छोटी या सही फॉर्मेट वाली PDF भेजें।")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
