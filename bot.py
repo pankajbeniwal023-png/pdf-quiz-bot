@@ -3,23 +3,19 @@ import json
 import logging
 import asyncio
 import random
-import warnings
-import fitz  # PyMuPDF
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
+from telegram import Update, Poll
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
     PollAnswerHandler,
+    MessageHandler,
     filters,
     ContextTypes
 )
 from google import genai
 from google.genai import types
 
-warnings.filterwarnings("ignore")
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,148 +24,137 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 RENDER_URL = os.environ.get("RENDER_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-USER_PDF_DATA = {}
+
+# मास्टर प्रश्नों का डेटाबेस (मेमोरी में)
+QUESTION_BANK = []
 POLL_TRACKER = {}
 
-# PDF से टेक्स्ट निकालने का फ़ंक्शन
-def extract_text_from_pdf(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text() + "\n"
-    return full_text
-
-# टेक्स्ट से सवाल बनाने का फ़ंक्शन
-async def generate_questions_from_text(pdf_text, num_questions):
-    # टेक्स्ट का रैंडम हिस्सा चुनना ताकि हर बार अलग सवाल बनें
-    max_chars = 30000
-    if len(pdf_text) > max_chars:
-        start_idx = random.randint(0, len(pdf_text) - max_chars)
-        selected_text = pdf_text[start_idx : start_idx + max_chars]
-    else:
-        selected_text = pdf_text
-
-    random_seed = random.randint(1000, 99999)
+# --- Gemini Rephraser Engine ---
+async def rephrase_question_with_ai(original_q: dict, mode: str):
+    """
+    यह फ़ंक्शन ओरिजिनल सवाल को बिना उसका उत्तर बदले
+    अलग-अलग लॉजिकल स्टाइल में रीफ़्रेम करेगा।
+    """
     prompt = f"""
-तुम एक परीक्षा विशेषज्ञ हो। नीचे दिए गए अध्ययन टेक्स्ट को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) शुद्ध एवं सरल हिंदी भाषा में बनाओ।
+तुम एक बहुत ही सख्त परीक्षा विशेषज्ञ हो। 
+नीचे एक सामान्य ज्ञान का ओरिजिनल प्रश्न, विकल्प और सही उत्तर का इंडेक्स दिया गया है:
+
+Original Question: {json.dumps(original_q, ensure_ascii=False)}
+
+तुम्हें इस सवाल का मुख्य कांसेप्ट (Concept) वही रखना है, लेकिन मोड '{mode}' के अनुसार इसे दोबारा लिखना है:
 
 **नियम:**
-1. (Seed: {random_seed}) हर बार नए, अलग और महत्वपूर्ण फैक्ट्स से सवाल चुनो।
-2. प्रत्येक प्रश्न के 4 स्पष्ट विकल्प हों।
-3. केवल शुद्ध JSON Array आउटपुट दो।
+1. **Mode 'twisted':** प्रश्न की भाषा थोड़ी घुमावदार और कठिन बनाओ ताकि विद्यार्थी को रटना न पड़े, बल्कि सोचना पड़े।
+2. **Mode 'statement':** प्रश्न को कथन और कारण (Statement 1 और Statement 2) के रूप में बदलो।
+3. **सही उत्तर बदलनी नहीं चाहिए:** जो विकल्प सही है, रीफ़्रेम होने के बाद भी वही विकल्प सही रहना चाहिए।
+4. **आउटपुट:** केवल और केवल शुद्ध JSON ऑब्जेक्ट दो।
 
-JSON प्रारूप:
-[
-  {{
-    "question": "प्रश्न?",
-    "options": ["ऑप्शन 1", "ऑप्शन 2", "ऑप्शन 3", "ऑप्शन 4"],
-    "answer": 0
-  }}
-]
-
-टेक्स्ट:
-{selected_text}
+JSON Format:
+{{
+  "question": "नया घुमावदार प्रश्न?",
+  "options": ["विकल्प 1", "विकल्प 2", "विकल्प 3", "विकल्प 4"],
+  "answer": {original_q['answer']}
+}}
 """
 
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash']
-    for model_name in models_to_try:
-        try:
-            response = await asyncio.to_thread(
-                ai_client.models.generate_content,
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.9,
-                ),
-            )
-            raw_text = response.text.strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-            elif raw_text.startswith("```"):
-                raw_text = raw_text.replace("```", "").strip()
+    try:
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.8,
+            ),
+        )
+        data = json.loads(response.text.strip())
+        return data
+    except Exception as e:
+        logger.error(f"Rephrase Error: {e}")
+        # अगर AI फ़ेल होता है तो ओरिजिनल सवाल ही रिटर्न कर देगा (No Breakage)
+        return original_q
 
-            data = json.loads(raw_text)
-            if isinstance(data, list) and len(data) > 0:
-                return data
-        except Exception as e:
-            logger.warning(f"Model {model_name} Error: {e}")
-            await asyncio.sleep(1)
-
-    return []
-
-# --- टेलीग्राम हैंडलर्स ---
+# --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in USER_PDF_DATA:
-        del USER_PDF_DATA[user_id]
-    await update.message.reply_text("👋 **PDF Revision Bot**\nअपनी PDF फ़ाइल यहाँ भेजें।")
+    msg = (
+        "🎯 **रटने के बजाय समझने वाला Quiz Bot**\n\n"
+        "1. सबसे पहले अपनी **JSON फ़ाइल** मुझे भेजें (जिसमें प्रश्न का डेटा हो)।\n"
+        "2. फिर नीचे दी गई कमांड्स का उपयोग करें:\n\n"
+        "📌 `/quiz 10` - सामान्य पैटर्न के 10 सवाल\n"
+        "🔄 `/twisted 10` - घुमावदार/लॉजिकल सवाल (AI Rephrased)\n"
+        "📝 `/statement 10` - कथन एवं कारण वाले सवाल"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# JSON फ़ाइल प्राप्त करने का हैंडलर
+async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global QUESTION_BANK
     doc = update.message.document
-    if not doc.file_name.lower().endswith('.pdf'):
-        return await update.message.reply_text("❌ केवल PDF भेजें।")
+    if not doc.file_name.lower().endswith('.json'):
+        return await update.message.reply_text("❌ कृपया केवल .json फ़ाइल भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF पढ़ी जा रही है...")
-    
+    msg = await update.message.reply_text("📥 JSON लोड हो रही है...")
     try:
         file = await context.bot.get_file(doc.file_id)
-        pdf_bytes = await file.download_as_bytearray()
-        
-        # PDF से तुरंत टेक्स्ट निकालें
-        pdf_text = extract_text_from_pdf(bytes(pdf_bytes))
+        content = await file.download_as_bytearray()
+        data = json.loads(content.decode('utf-8'))
 
-        if not pdf_text.strip():
-            return await msg.edit_text("❌ इस PDF में टेक्स्ट नहीं मिला (हो सकता है यह केवल स्कैन की गई इमेजेस हों)।")
-
-        user_id = update.effective_user.id
-        USER_PDF_DATA[user_id] = {
-            "text": pdf_text,
-            "filename": doc.file_name
-        }
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10"), InlineKeyboardButton("🔥 20 Questions", callback_data="gen_20")],
-            [InlineKeyboardButton("⚡ 30 Questions", callback_data="gen_30"), InlineKeyboardButton("🚀 50 Questions", callback_data="gen_50")]
-        ])
-
-        await msg.edit_text(f"✅ **PDF लोड हो गई!**\n📄 `{doc.file_name}`\n\nकितने सवालों से रिवीजन करना है?", reply_markup=keyboard, parse_mode="Markdown")
+        if isinstance(data, list) and len(data) > 0:
+            QUESTION_BANK = data
+            await msg.edit_text(f"✅ **सफलतापूर्वक {len(QUESTION_BANK)} सवाल लोड हो गए!**\n\nअब अभ्यास शुरू करने के लिए `/twisted 5` या `/quiz 10` टाइप करें।", parse_mode="Markdown")
+        else:
+            await msg.edit_text("❌ JSON में प्रश्नों का प्रारूप सही नहीं है।")
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await msg.edit_text("❌ PDF प्रोसेस करने में समस्या आई।")
+        logger.error(f"JSON Error: {e}")
+        await msg.edit_text("❌ JSON फ़ाइल पढ़ने में त्रुटि हुई।")
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# क्विज़ कमांड्स
+async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    global QUESTION_BANK
+    if not QUESTION_BANK:
+        return await update.message.reply_text("❌ पहले अपनी Master JSON फ़ाइल बॉट को भेजें!")
+
+    # यूजर ने कितने सवाल माँगे हैं (By Default 5)
+    count = 5
+    if context.args and context.args[0].isdigit():
+        count = int(context.args[0])
+
+    selected_raw = random.sample(QUESTION_BANK, min(count, len(QUESTION_BANK)))
     
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    data = query.data
+    msg = await update.message.reply_text(f"⚡ AI आपके प्रश्नों को `{mode.upper()}` स्टाइल में तैयार कर रहा है... ⏳", parse_mode="Markdown")
 
-    if data.startswith("gen_"):
-        num_qs = int(data.split("_")[1])
-        
-        if user_id not in USER_PDF_DATA or "text" not in USER_PDF_DATA[user_id]:
-            return await query.edit_message_text("❌ PDF डेटा नहीं मिला। फिर से PDF भेजें: /start")
+    processed_questions = []
+    for q in selected_raw:
+        if mode in ['twisted', 'statement']:
+            rephrased = await rephrase_question_with_ai(q, mode)
+            processed_questions.append(rephrased)
+        else:
+            processed_questions.append(q)
 
-        pdf_text = USER_PDF_DATA[user_id]["text"]
-        await query.edit_message_text(f"⚡ PDF से {num_qs} नए सवाल तैयार हो रहे हैं... ⏳")
+    await msg.delete()
 
-        quiz_data = await generate_questions_from_text(pdf_text, num_qs)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-        if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सर्वर रिस्पॉन्स नहीं दे पाया। कृपया बटन दोबारा दबाएँ।")
+    context.user_data.clear()
+    context.user_data.update({
+        "quiz": processed_questions,
+        "idx": 0,
+        "score": 0,
+        "total": len(processed_questions),
+        "busy": True
+    })
 
-        context.user_data.clear()
-        context.user_data.update({
-            "quiz": quiz_data,
-            "idx": 0,
-            "score": 0,
-            "total": len(quiz_data),
-            "busy": True
-        })
+    await send_next_quiz(context, chat_id, user_id)
 
-        await send_next_quiz(context, chat_id, user_id)
+async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update, context, mode="direct")
+
+async def twisted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update, context, mode="twisted")
+
+async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update, context, mode="statement")
 
 async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     user_data = context.application.user_data.get(user_id)
@@ -183,7 +168,7 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = f"🎉 **रिवीजन क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
+        res = f"🎉 **अभ्यास समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown")
         user_data["busy"] = False
         return
@@ -232,12 +217,15 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_data["score"] += 1
         await send_next_quiz(context, chat_id, user_id)
 
+# --- AIOHTTP Server & Webhook ---
 async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    ptb_app.add_handler(CallbackQueryHandler(handle_callback))
+    ptb_app.add_handler(CommandHandler("quiz", quiz_cmd))
+    ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
+    ptb_app.add_handler(CommandHandler("statement", statement_cmd))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await ptb_app.initialize()
