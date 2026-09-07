@@ -50,20 +50,17 @@ async def test_gemini_api():
     except Exception as e:
         return False, str(e)
 
-# --- Robust PDF Quiz Generator (3-Times Retry + Strong Randomization) ---
-async def generate_quiz_from_pdf_bytes(pdf_bytes: bytes, file_name: str, num_questions: int):
-    # रैंडम सीड ताकि हर बार PDF के अलग-अलग हिस्सों से अलग सवाल बनें
+# --- सिंगल बैच से सवाल जनरेट करने का फ़ंक्शन ---
+async def fetch_single_batch(pdf_bytes: bytes, num_questions: int, batch_id: int):
     random_seed = random.randint(10000, 999999)
-    
     prompt = f"""
-तुम एक बहुत ही अनुभवी परीक्षा विशेषज्ञ और शिक्षक हो।
-इस अपलोड की गई PDF/इमेज फाइल को पूरी तरह ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) हिंदी में तैयार करो।
+तुम एक बहुत ही सख्त और कुशल परीक्षा विशेषज्ञ हो।
+इस PDF फाइल को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) आसान व स्पष्ट हिंदी में बनाओ।
 
-**सख्त निर्देश:**
-1. **रैंडम और विविधता (Seed: {random_seed}):** हर बार PDF के अलग-अलग अध्यायों, पैराग्राफों और नए टॉपिक्स से सवाल चुनो। पिछली बार पूछे गए साधारण या दोहराए गए सवालों से बचो। पूरे कंटेंट का कवरेज होना चाहिए।
-2. **सरल और स्पष्ट भाषा:** सवाल और विकल्प बहुत ही स्पष्ट, सटीक और आसान हिंदी भाषा में होने चाहिए ताकि विद्यार्थी को समझने में कोई उलझन न हो।
-3. **सटीक विकल्प:** प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए। 1 विकल्प सही और 3 गलत लेकिन प्रासंगिक विकल्प हों।
-4. **आउटपुट फ़ॉर्मेट:** आउटपुट केवल और केवल एक वैध शुद्ध JSON Array होना चाहिए। कोई extra टेक्स्ट या मर्कडाउन ब्लॉक मत दो।
+**सख्त नियम:**
+1. **रैंडमनेस (Batch {batch_id}, Seed {random_seed}):** PDF के अलग-अलग अध्यायों और टॉपिक्स से अनूठे सवाल चुनो।
+2. **सटीक विकल्प:** प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
+3. **आउटपुट:** केवल और केवल शुद्ध JSON Array होना चाहिए।
 
 JSON प्रारूप:
 [
@@ -73,46 +70,55 @@ JSON प्रारूप:
     "answer": 0
   }}
 ]
-
-ध्यान दें: "answer" का मान 0 से 3 तक का सही विकल्प इंडेक्स होना चाहिए।
 """
+    try:
+        pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model='gemini-3.6-flash',
+            contents=[pdf_part, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.9,
+            ),
+        )
+        raw_text = response.text.strip()
+        if raw_text.startswith("```json"):
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        elif raw_text.startswith("```"):
+            raw_text = raw_text.replace("```", "").strip()
 
-    # ऑटो-रीट्राई लॉजिक (3 बार कोशिश करेगा ताकि कभी Fail न हो)
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Generating Quiz Attempt {attempt}/{max_retries}...")
-            pdf_part = types.Part.from_bytes(
-                data=pdf_bytes,
-                mime_type="application/pdf",
-            )
+        data = json.loads(raw_text)
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        logger.error(f"Batch {batch_id} Error: {e}")
+    return []
 
-            response = await asyncio.to_thread(
-                ai_client.models.generate_content,
-                model='gemini-3.6-flash',
-                contents=[pdf_part, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.9,  # उच्च क्रिएटिविटी और रैंडम सवालों के लिए
-                ),
-            )
-            
-            raw_text = response.text.strip()
-            # मार्कडाउन फॉर्मेटिंग साफ़ करना अगर गलती से AI दे दे
-            if raw_text.startswith("```json"):
-                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-            elif raw_text.startswith("```"):
-                raw_text = raw_text.replace("```", "").strip()
+# --- 100-200 सवालों के लिए पैरेलल बैच जनरेटर ---
+async def generate_quiz_parallel(pdf_bytes: bytes, total_questions: int):
+    # अधिकतम 25 सवालों के टुकड़ों में बांटना
+    batch_size = 20 if total_questions <= 50 else 25
+    tasks = []
+    
+    remaining = total_questions
+    batch_id = 1
+    while remaining > 0:
+        current_batch = min(batch_size, remaining)
+        tasks.append(fetch_single_batch(pdf_bytes, current_batch, batch_id))
+        remaining -= current_batch
+        batch_id += 1
 
-            data = json.loads(raw_text)
-            if isinstance(data, list) and len(data) > 0:
-                return data
-        except Exception as e:
-            logger.warning(f"Attempt {attempt} failed with error: {e}")
-            await asyncio.sleep(1.5)  # 1.5 सेकंड रुककर फिर प्रयास करेगा
+    # सभी पैरेलल ऑर्डर्स को एक साथ चलाएँ
+    results = await asyncio.gather(*tasks)
+    
+    all_questions = []
+    for q_list in results:
+        all_questions.extend(q_list)
 
-    logger.error("All retries failed for quiz generation.")
-    return None
+    # सवालों को शफ़ल करें
+    random.shuffle(all_questions)
+    return all_questions[:total_questions]
 
 # --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,8 +130,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **PDF Quiz Generator Bot में आपका स्वागत है!**\n\n"
         "📖 **इस्तेमाल कैसे करें:**\n"
         "1. अपनी कोई भी **PDF फ़ाइल** यहाँ भेजें।\n"
-        "2. फिर प्रश्नों की संख्या चुनें।\n\n"
-        "✨ **खासियत:** हर बार नए, रैंडम और आसान भाषा में सवाल मिलेंगे!\n"
+        "2. फिर प्रश्नों की संख्या चुनें (10 से 200 तक)।\n\n"
+        "⚡ **सुपर-फ़ास्ट पैरेलल AI स्पीड के साथ!**\n"
         "🔍 **Gemini API जाँचने के लिए:** /testgemini भेजें।"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
@@ -156,9 +162,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10")],
-            [InlineKeyboardButton("🔥 20 Questions", callback_data="gen_20")],
-            [InlineKeyboardButton("⚡ 30 Questions", callback_data="gen_30")]
+            [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10"), InlineKeyboardButton("🔥 25 Questions", callback_data="gen_25")],
+            [InlineKeyboardButton("⚡ 50 Questions", callback_data="gen_50"), InlineKeyboardButton("🚀 100 Questions", callback_data="gen_100")],
+            [InlineKeyboardButton("🏆 200 Questions", callback_data="gen_200")]
         ])
 
         await msg.edit_text(
@@ -186,14 +192,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await query.edit_message_text("❌ PDF का डेटा नहीं मिला। कृपया फिर से PDF भेजें: /start")
 
         pdf_bytes = USER_PDF_DATA[user_id]["bytes"]
-        file_name = USER_PDF_DATA[user_id]["filename"]
         
-        await query.edit_message_text(f"🤖 Gemini AI पूरी PDF को पढ़कर {num_qs} नए व रैंडम सवाल बना रहा है... ⏳")
+        await query.edit_message_text(f"🚀 पैरेलल AI इंजन सक्रिय! {num_qs} नए सवाल तैयार किए जा रहे हैं... ⏳")
 
-        quiz_data = await generate_quiz_from_pdf_bytes(pdf_bytes, file_name, num_qs)
+        quiz_data = await generate_quiz_parallel(pdf_bytes, num_qs)
 
-        if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया बटन पर फिर से क्लिक करें।")
+        if not quiz_data or len(quiz_data) == 0:
+            return await context.bot.send_message(chat_id, "❌ सवाल जनरेट करने में समस्या आई। कृपया दोबारा बटन दबाएँ।")
 
         context.user_data.clear()
         context.user_data.update({
