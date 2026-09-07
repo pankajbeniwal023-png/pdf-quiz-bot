@@ -25,34 +25,39 @@ RENDER_URL = os.environ.get("RENDER_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# मास्टर प्रश्नों का डेटाबेस (मेमोरी में)
+# डेटा स्टोर
 QUESTION_BANK = []
+ASKED_QUESTION_IDS = set()  # पूछे जा चुके प्रश्नों के इंडेक्स
 POLL_TRACKER = {}
 
-# --- Gemini Rephraser Engine ---
+# --- Gemini Rephraser Engine (Strict Unique Variations) ---
 async def rephrase_question_with_ai(original_q: dict, mode: str):
-    """
-    यह फ़ंक्शन ओरिजिनल सवाल को बिना उसका उत्तर बदले
-    अलग-अलग लॉजिकल स्टाइल में रीफ़्रेम करेगा।
-    """
+    random_seed = random.randint(1000, 999999)
+    
     prompt = f"""
-तुम एक बहुत ही सख्त परीक्षा विशेषज्ञ हो। 
-नीचे एक सामान्य ज्ञान का ओरिजिनल प्रश्न, विकल्प और सही उत्तर का इंडेक्स दिया गया है:
+तुम एक बहुत ही उच्च स्तर के परीक्षा नियंत्रक हो।
+नीचे दिया गया प्रश्न एक मूल सामान्य ज्ञान प्रश्न है:
+{json.dumps(original_q, ensure_ascii=False)}
 
-Original Question: {json.dumps(original_q, ensure_ascii=False)}
+**तुम्हारा काम:**
+इस प्रश्न का मुख्य तथ्य/ज्ञान (Core Fact) वही रखना है, लेकिन इसे बिल्कुल नए और अनोखे अंदाज़ में फिर से लिखना है ताकि छात्र को रटा-रटाया सवाल न मिले।
 
-तुम्हें इस सवाल का मुख्य कांसेप्ट वही रखना है, लेकिन मोड '{mode}' के अनुसार इसे दोबारा लिखना है:
+**मोड (Mode) के नियम:**
+1. यदि mode = 'statement':
+   - प्रश्न को "कथन I" और "कथन II" या "कथन (Assertion)" और "कारण (Reason)" के रूप में लिखो।
+   - विकल्पों में दो/चार कथन संबंधित निष्कर्ष दो।
+2. यदि mode = 'twisted' या 'varied':
+   - प्रश्न की भाषा, संरचना और शब्दावली को पूरी तरह बदलो।
+   - प्रश्न को किसी परिस्थिति (Scenario) या विश्लेषणात्मक प्रश्न के रूप में घुमाकर पूछो।
 
-**नियम:**
-1. **Mode 'twisted':** प्रश्न की भाषा थोड़ी घुमावदार और कठिन बनाओ ताकि विद्यार्थी को रटना न पड़े, बल्कि सोचना पड़े।
-2. **Mode 'statement':** प्रश्न को कथन और कारण (Statement 1 और Statement 2) के रूप में बदलो।
-3. **सही उत्तर बदलना नहीं चाहिए:** जो विकल्प सही है, रीफ़्रेम होने के बाद भी वही विकल्प सही रहना चाहिए।
-4. **आउटपुट:** केवल और केवल शुद्ध JSON ऑब्जेक्ट दो।
+**अनिवार्य शर्तें (Seed: {random_seed}):**
+- मूल प्रश्न का जो उत्तर सही है, वही उत्तर विकल्प सूची में सही रहना चाहिए।
+- आउटपुट केवल और केवल शुद्ध JSON Format में दो।
 
 JSON Format:
 {{
-  "question": "नया घुमावदार प्रश्न?",
-  "options": ["विकल्प 1", "विकल्प 2", "विकल्प 3", "विकल्प 4"],
+  "question": "नया घुमावदार या कथन-कारण वाला प्रश्न?",
+  "options": ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"],
   "answer": {original_q['answer']}
 }}
 """
@@ -64,83 +69,92 @@ JSON Format:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.8,
+                temperature=0.9,  # अधिक विविधता (Variety) के लिए
             ),
         )
         data = json.loads(response.text.strip())
         return data
     except Exception as e:
         logger.error(f"Rephrase Error: {e}")
-        # अगर AI फ़ेल होता है तो ओरिजिनल सवाल ही रिटर्न करेगा
         return original_q
 
 # --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🎯 **रटने के बजाय समझने वाला Quiz Bot**\n\n"
-        "1. सबसे पहले प्रश्नों की **.json या .txt फ़ाइल** मुझे भेजें।\n"
-        "2. फिर नीचे दी गई कमांड्स का उपयोग करें:\n\n"
-        "📌 `/quiz 10` - सामान्य तरीके से 10 सवाल\n"
-        "🔄 `/twisted 10` - घुमावदार/लॉजिकल सवाल (AI Rephrased)\n"
-        "📝 `/statement 10` - कथन एवं कारण वाले सवाल"
+        "🧠 **स्मार्ट रिवीज़न Quiz Bot**\n\n"
+        "यह बॉट कभी भी एक सवाल या भाषा को **दोबारा रिपीट नहीं करेगा**।\n\n"
+        "1. सबसे पहले `.json` या `.txt` फ़ाइल भेजें।\n"
+        "2. फिर अभ्यास के लिए ये कमांड्स प्रयोग करें:\n\n"
+        "📌 `/quiz 10` - नए तरीके से पूछे गए 10 अनोखे सवाल\n"
+        "📝 `/statement 10` - 100% कथन एवं कारण वाले सवाल\n"
+        "🔄 `/twisted 10` - घुमावदार लॉजिकल सवाल\n"
+        "🧹 `/reset` - पूछे गए प्रश्नों की हिस्ट्री साफ़ करने के लिए"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# .JSON या .TXT फ़ाइल प्राप्त करने का हैंडलर
+# फ़ाइल अपलोड हैंडलर
 async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global QUESTION_BANK
+    global QUESTION_BANK, ASKED_QUESTION_IDS
     doc = update.message.document
     file_name = doc.file_name.lower()
     
-    # .json और .txt दोनों फ़ाइलों की अनुमति
     if not (file_name.endswith('.json') or file_name.endswith('.txt')):
-        return await update.message.reply_text("❌ कृपया केवल .json या .txt फ़ाइल ही भेजें।")
+        return await update.message.reply_text("❌ केवल .json या .txt फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 फ़ाइल पढ़ी जा रही है...")
+    msg = await update.message.reply_text("📥 फ़ाइल लोड हो रही है...")
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
         
-        # टेक्स्ट को डिकोड करके JSON में बदलना
         text_data = content.decode('utf-8').strip()
         data = json.loads(text_data)
 
         if isinstance(data, list) and len(data) > 0:
             QUESTION_BANK = data
+            ASKED_QUESTION_IDS.clear()  # नई फ़ाइल आने पर हिस्ट्री क्लियर
             await msg.edit_text(
                 f"✅ **सफलतापूर्वक {len(QUESTION_BANK)} सवाल लोड हो गए!**\n\n"
-                "अब अभ्यास शुरू करने के लिए `/twisted 5` या `/quiz 10` टाइप करें।", 
+                "अब अभ्यास शुरू करने के लिए `/quiz 10` या `/statement 5` टाइप करें।", 
                 parse_mode="Markdown"
             )
         else:
             await msg.edit_text("❌ फ़ाइल में डेटा सही JSON लिस्ट फॉर्मेट में नहीं है।")
-    except json.JSONDecodeError:
-        await msg.edit_text("❌ फ़ाइल में मौजूद टेक्स्ट सही JSON फॉर्मेट में नहीं है। कृपया ब्रैकेट [ ] और कोमा (,) चेक करें।")
     except Exception as e:
         logger.error(f"File Load Error: {e}")
-        await msg.edit_text("❌ फ़ाइल पढ़ने में त्रुटि हुई।")
+        await msg.edit_text("❌ फ़ाइल पढ़ने में त्रुटि हुई। कृपया फॉर्मेट चेक करें।")
 
-# क्विज़ सेसन्स
+# क्विज़ सेशन (No-Repeat Logic)
 async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    global QUESTION_BANK
+    global QUESTION_BANK, ASKED_QUESTION_IDS
     if not QUESTION_BANK:
-        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली .json या .txt फ़ाइल बॉट को भेजें!")
+        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली फ़ाइल बॉट को भेजें!")
+
+    # अभी तक न पूछे गए प्रश्नों के इंडेक्स चुनना
+    unasked_indices = [i for i in range(len(QUESTION_BANK)) if i not in ASKED_QUESTION_IDS]
+
+    if not unasked_indices:
+        return await update.message.reply_text(
+            "🎉 **बधाई हो! आप अपनी फ़ाइल के सभी सवालों का अभ्यास कर चुके हैं!**\n\n"
+            "दोबारा शुरुआत से नए अंदाज़ में शुरू करने के लिए `/reset` कमांड दें।"
+        )
 
     count = 5
     if context.args and context.args[0].isdigit():
         count = int(context.args[0])
 
-    selected_raw = random.sample(QUESTION_BANK, min(count, len(QUESTION_BANK)))
+    # जितने बचे हैं और जितनी मांग है, उनमें से रैंडम चुनाव
+    selected_indices = random.sample(unasked_indices, min(count, len(unasked_indices)))
     
-    msg = await update.message.reply_text(f"⚡ AI आपके प्रश्नों को `{mode.upper()}` स्टाइल में तैयार कर रहा है... ⏳", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"⚡ AI आपके लिए बिल्कुल **नए तरीके** से सवाल तैयार कर रहा है... ⏳", parse_mode="Markdown")
 
     processed_questions = []
-    for q in selected_raw:
-        if mode in ['twisted', 'statement']:
-            rephrased = await rephrase_question_with_ai(q, mode)
-            processed_questions.append(rephrased)
-        else:
-            processed_questions.append(q)
+    for idx in selected_indices:
+        ASKED_QUESTION_IDS.add(idx)  # पूछे जा चुके सवालों में जोड़ें
+        raw_q = QUESTION_BANK[idx]
+        
+        # हर बार सवाल को AI से Reframe करवाना अनिवार्य है
+        rephrased = await rephrase_question_with_ai(raw_q, mode)
+        processed_questions.append(rephrased)
 
     await msg.delete()
 
@@ -158,14 +172,20 @@ async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await send_next_quiz(context, chat_id, user_id)
 
+# कमांड्स
 async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="direct")
+    await start_quiz_session(update, context, mode="varied")
+
+async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update, context, mode="statement")
 
 async def twisted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_quiz_session(update, context, mode="twisted")
 
-async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="statement")
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ASKED_QUESTION_IDS
+    ASKED_QUESTION_IDS.clear()
+    await update.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!** अब सवाल बिल्कुल शुरुआत से पूछे जा सकेंगे।")
 
 async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     user_data = context.application.user_data.get(user_id)
@@ -179,7 +199,13 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = f"🎉 **अभ्यास समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
+        remaining = len(QUESTION_BANK) - len(ASKED_QUESTION_IDS)
+        res = (
+            f"🎉 **क्विज़ समाप्त!**\n\n"
+            f"✅ सही उत्तर: {score} / {total}\n"
+            f"📊 आपका स्कोर: {per}%\n"
+            f"📚 फ़ाइल में अभी **{remaining}** नए सवाल बाकी हैं।"
+        )
         await context.bot.send_message(chat_id, res, parse_mode="Markdown")
         user_data["busy"] = False
         return
@@ -234,8 +260,9 @@ async def main():
 
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("quiz", quiz_cmd))
-    ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
     ptb_app.add_handler(CommandHandler("statement", statement_cmd))
+    ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
+    ptb_app.add_handler(CommandHandler("reset", reset_cmd))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
