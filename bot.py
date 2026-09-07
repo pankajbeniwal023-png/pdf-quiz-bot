@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-import pypdf
+import pdfplumber
 from google import genai
 from google.genai import types
 
@@ -34,15 +34,15 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Helper: PDF से टेक्स्ट निकालना ---
+# --- Helper: pdfplumber से सटीक टेक्स्ट निकालना ---
 def extract_text_from_pdf(pdf_bytes):
     pdf_file = io.BytesIO(pdf_bytes)
-    reader = pypdf.PdfReader(pdf_file)
     extracted_text = ""
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            extracted_text += t + "\n"
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                extracted_text += t + "\n"
     return extracted_text.strip()
 
 # --- Helper: Gemini AI से सवाल बनवाना ---
@@ -53,10 +53,11 @@ async def generate_quiz_from_text(pdf_text: str, num_questions: int):
 
 **सख्त नियम:**
 1. उत्तर केवल और केवल नीचे दिए गए टेक्स्ट में मौजूद तथ्यों पर आधारित होने चाहिए। अपने मन या बाहर के ज्ञान से कोई उत्तर मत देना।
-2. प्रश्नों का तरीका और भाषा हर बार अलग और नई होना चाहिए।
+2. प्रश्नों का तरीका और भाषा हर बार अलग और नई होनी चाहिए ताकि बेहतरीन रिवीजन हो।
 3. प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
-4. JSON संरचना बिल्कुल इस प्रारूप में होनी चाहिए:
+4. आउटपुट केवल और केवल शुद्ध JSON एरे (Array) में होना चाहिए।
 
+JSON प्रारूप:
 [
   {{
     "question": "प्रश्न का पाठ",
@@ -65,7 +66,7 @@ async def generate_quiz_from_text(pdf_text: str, num_questions: int):
   }}
 ]
 
-ध्यान दें: "answer" इंडेक्स 0 से 3 तक होना चाहिए।
+ध्यान दें: "answer" का मान 0 से 3 तक का इंडेक्स होना चाहिए।
 
 टेक्स्ट सामग्री:
 {pdf_text[:12000]}  
@@ -105,15 +106,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc.file_name.endswith('.pdf'):
         return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF लोड हो रही है...")
+    msg = await update.message.reply_text("📥 PDF डाउनलोड हो रही है और टेक्स्ट निकाला जा रहा है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
         pdf_text = extract_text_from_pdf(pdf_bytes)
 
-        if not pdf_text or len(pdf_text) < 50:
-            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका।")
+        if not pdf_text or len(pdf_text) < 30:
+            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका। (यह पूरी तरह इमेज-बेस्ड या स्कैन की हुई हो सकती है)।")
 
         user_id = update.effective_user.id
         USER_PDF_DATA[user_id] = {"text": pdf_text, "filename": doc.file_name}
@@ -125,7 +126,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await msg.edit_text(
-            f"✅ **PDF लोड हो गई!**\n📄 फ़ाइल: `{doc.file_name}`\n\n"
+            f"✅ **PDF सफलतापूर्वक लोड हो गई!**\n📄 फ़ाइल: `{doc.file_name}`\n\n"
             "👇 **कितने सवालों का क्विज़ खेलना चाहते हैं?**",
             reply_markup=keyboard,
             parse_mode="Markdown"
@@ -154,7 +155,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz_data = await generate_quiz_from_text(pdf_text, num_qs)
 
         if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। पुनः प्रयास करें।")
+            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया बटन पर फिर से क्लिक करें।")
 
         context.user_data.clear()
         context.user_data.update({
@@ -240,12 +241,9 @@ async def main():
     await ptb_app.initialize()
     await ptb_app.start()
 
-    # Webhook सेट करना
     webhook_url = f"{RENDER_URL}/{TOKEN}"
     await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    logger.info(f"Webhook set to: {webhook_url}")
 
-    # Aiohttp Web Server
     web_app = web.Application()
 
     async def telegram_webhook(request):
@@ -269,7 +267,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    logger.info(f"Server running on port {port}")
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
