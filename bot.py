@@ -38,7 +38,7 @@ async def test_gemini_api():
         prompt = "एक आसान सामान्य ज्ञान प्रश्न JSON प्रारूप में बनाओ। प्रारूप: [{\"question\": \"...\", \"options\": [\"a\", \"b\", \"c\", \"d\"], \"answer\": 0}]"
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -79,7 +79,7 @@ JSON प्रारूप:
 
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=[pdf_part, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
