@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import random
+import warnings
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import (
@@ -16,6 +17,10 @@ from telegram.ext import (
 )
 from google import genai
 from google.genai import types
+
+# --- AFC Warning को पूरी तरह दबाने (Suppress) का फ़िक्स ---
+warnings.filterwarnings("ignore", category=UserWarning, module="google_genai")
+warnings.filterwarnings("ignore", message=".*Direct use of automatic function calling.*")
 
 # --- लॉगिंग सेटअप ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -38,7 +43,7 @@ async def test_gemini_api():
         prompt = "एक आसान सामान्य ज्ञान प्रश्न JSON प्रारूप में बनाओ। प्रारूप: [{\"question\": \"...\", \"options\": [\"a\", \"b\", \"c\", \"d\"], \"answer\": 0}]"
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-3.6-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -49,7 +54,7 @@ async def test_gemini_api():
     except Exception as e:
         return False, str(e)
 
-# --- सिंगल बैच जनरेटर (No-AFC Fix Added) ---
+# --- ऑटो-रीट्राई और फॉलबैक के साथ बैच जनरेटर ---
 async def fetch_single_batch(pdf_bytes: bytes, num_questions: int, batch_id: int):
     random_seed = random.randint(10000, 999999)
     prompt = f"""
@@ -70,34 +75,47 @@ JSON प्रारूप:
   }}
 ]
 """
-    try:
-        pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-        
-        # AFC (Automatic Function Calling) बंद करने के लिए config
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.9,
-            tools=[],  # tools खाली करके AFC डिसेबल किया
-        )
+    # 503 / Server Error से बचने के लिए Retries और Fallback Models
+    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash']
+    max_retries = 3
 
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model='gemini-3.6-flash',
-            contents=[pdf_part, prompt],
-            config=config,
-        )
-        
-        raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        elif raw_text.startswith("```"):
-            raw_text = raw_text.replace("```", "").strip()
+    for model_name in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+                
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.8,
+                )
 
-        data = json.loads(raw_text)
-        if isinstance(data, list):
-            return data
-    except Exception as e:
-        logger.error(f"Batch {batch_id} Error: {e}")
+                response = await asyncio.to_thread(
+                    ai_client.models.generate_content,
+                    model=model_name,
+                    contents=[pdf_part, prompt],
+                    config=config,
+                )
+                
+                raw_text = response.text.strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                elif raw_text.startswith("```"):
+                    raw_text = raw_text.replace("```", "").strip()
+
+                data = json.loads(raw_text)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+
+            except Exception as e:
+                err_str = str(e)
+                logger.warning(f"Batch {batch_id} (Attempt {attempt+1}, Model {model_name}) Failed: {err_str}")
+                
+                # यदि 503 ओवरलोड की समस्या है तो थोड़ा रुककर फिर प्रयास करें
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    await asyncio.sleep(2 * (attempt + 1))
+                else:
+                    break  # अन्य त्रुटि पर तुरंत अगला मॉडल ट्राइ करें
+
     return []
 
 # --- पैरेलल बैच जनरेटर ---
@@ -199,7 +217,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz_data = await generate_quiz_parallel(pdf_bytes, num_qs)
 
         if not quiz_data or len(quiz_data) == 0:
-            return await context.bot.send_message(chat_id, "❌ सवाल जनरेट करने में समस्या आई। कृपया दोबारा बटन दबाएँ।")
+            return await context.bot.send_message(chat_id, "❌ सर्वर व्यस्त होने के कारण सवाल जनरेट नहीं हो सके। कृपया दोबारा कोशिश करें।")
 
         context.user_data.clear()
         context.user_data.update({
