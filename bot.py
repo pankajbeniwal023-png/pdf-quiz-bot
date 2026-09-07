@@ -41,12 +41,12 @@ async def rephrase_question_with_ai(original_q: dict, mode: str):
 
 Original Question: {json.dumps(original_q, ensure_ascii=False)}
 
-तुम्हें इस सवाल का मुख्य कांसेप्ट (Concept) वही रखना है, लेकिन मोड '{mode}' के अनुसार इसे दोबारा लिखना है:
+तुम्हें इस सवाल का मुख्य कांसेप्ट वही रखना है, लेकिन मोड '{mode}' के अनुसार इसे दोबारा लिखना है:
 
 **नियम:**
 1. **Mode 'twisted':** प्रश्न की भाषा थोड़ी घुमावदार और कठिन बनाओ ताकि विद्यार्थी को रटना न पड़े, बल्कि सोचना पड़े।
 2. **Mode 'statement':** प्रश्न को कथन और कारण (Statement 1 और Statement 2) के रूप में बदलो।
-3. **सही उत्तर बदलनी नहीं चाहिए:** जो विकल्प सही है, रीफ़्रेम होने के बाद भी वही विकल्प सही रहना चाहिए।
+3. **सही उत्तर बदलना नहीं चाहिए:** जो विकल्प सही है, रीफ़्रेम होने के बाद भी वही विकल्प सही रहना चाहिए।
 4. **आउटपुट:** केवल और केवल शुद्ध JSON ऑब्जेक्ट दो।
 
 JSON Format:
@@ -71,50 +71,61 @@ JSON Format:
         return data
     except Exception as e:
         logger.error(f"Rephrase Error: {e}")
-        # अगर AI फ़ेल होता है तो ओरिजिनल सवाल ही रिटर्न कर देगा (No Breakage)
+        # अगर AI फ़ेल होता है तो ओरिजिनल सवाल ही रिटर्न करेगा
         return original_q
 
 # --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🎯 **रटने के बजाय समझने वाला Quiz Bot**\n\n"
-        "1. सबसे पहले अपनी **JSON फ़ाइल** मुझे भेजें (जिसमें प्रश्न का डेटा हो)।\n"
+        "1. सबसे पहले प्रश्नों की **.json या .txt फ़ाइल** मुझे भेजें।\n"
         "2. फिर नीचे दी गई कमांड्स का उपयोग करें:\n\n"
-        "📌 `/quiz 10` - सामान्य पैटर्न के 10 सवाल\n"
+        "📌 `/quiz 10` - सामान्य तरीके से 10 सवाल\n"
         "🔄 `/twisted 10` - घुमावदार/लॉजिकल सवाल (AI Rephrased)\n"
         "📝 `/statement 10` - कथन एवं कारण वाले सवाल"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# JSON फ़ाइल प्राप्त करने का हैंडलर
-async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# .JSON या .TXT फ़ाइल प्राप्त करने का हैंडलर
+async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global QUESTION_BANK
     doc = update.message.document
-    if not doc.file_name.lower().endswith('.json'):
-        return await update.message.reply_text("❌ कृपया केवल .json फ़ाइल भेजें।")
+    file_name = doc.file_name.lower()
+    
+    # .json और .txt दोनों फ़ाइलों की अनुमति
+    if not (file_name.endswith('.json') or file_name.endswith('.txt')):
+        return await update.message.reply_text("❌ कृपया केवल .json या .txt फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 JSON लोड हो रही है...")
+    msg = await update.message.reply_text("📥 फ़ाइल पढ़ी जा रही है...")
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
-        data = json.loads(content.decode('utf-8'))
+        
+        # टेक्स्ट को डिकोड करके JSON में बदलना
+        text_data = content.decode('utf-8').strip()
+        data = json.loads(text_data)
 
         if isinstance(data, list) and len(data) > 0:
             QUESTION_BANK = data
-            await msg.edit_text(f"✅ **सफलतापूर्वक {len(QUESTION_BANK)} सवाल लोड हो गए!**\n\nअब अभ्यास शुरू करने के लिए `/twisted 5` या `/quiz 10` टाइप करें।", parse_mode="Markdown")
+            await msg.edit_text(
+                f"✅ **सफलतापूर्वक {len(QUESTION_BANK)} सवाल लोड हो गए!**\n\n"
+                "अब अभ्यास शुरू करने के लिए `/twisted 5` या `/quiz 10` टाइप करें।", 
+                parse_mode="Markdown"
+            )
         else:
-            await msg.edit_text("❌ JSON में प्रश्नों का प्रारूप सही नहीं है।")
+            await msg.edit_text("❌ फ़ाइल में डेटा सही JSON लिस्ट फॉर्मेट में नहीं है।")
+    except json.JSONDecodeError:
+        await msg.edit_text("❌ फ़ाइल में मौजूद टेक्स्ट सही JSON फॉर्मेट में नहीं है। कृपया ब्रैकेट [ ] और कोमा (,) चेक करें।")
     except Exception as e:
-        logger.error(f"JSON Error: {e}")
-        await msg.edit_text("❌ JSON फ़ाइल पढ़ने में त्रुटि हुई।")
+        logger.error(f"File Load Error: {e}")
+        await msg.edit_text("❌ फ़ाइल पढ़ने में त्रुटि हुई।")
 
-# क्विज़ कमांड्स
+# क्विज़ सेसन्स
 async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
     global QUESTION_BANK
     if not QUESTION_BANK:
-        return await update.message.reply_text("❌ पहले अपनी Master JSON फ़ाइल बॉट को भेजें!")
+        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली .json या .txt फ़ाइल बॉट को भेजें!")
 
-    # यूजर ने कितने सवाल माँगे हैं (By Default 5)
     count = 5
     if context.args and context.args[0].isdigit():
         count = int(context.args[0])
@@ -225,7 +236,7 @@ async def main():
     ptb_app.add_handler(CommandHandler("quiz", quiz_cmd))
     ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
     ptb_app.add_handler(CommandHandler("statement", statement_cmd))
-    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await ptb_app.initialize()
