@@ -1,7 +1,6 @@
 import os
 import io
 import json
-import random
 import logging
 import asyncio
 from aiohttp import web
@@ -31,7 +30,7 @@ RENDER_URL = os.environ.get("RENDER_URL")
 # Gemini AI क्लाइंट
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# रैम/मेमोरी स्टोर (GitHub की ज़रूरत नहीं है)
+# मेमोरी स्टोर
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
@@ -49,14 +48,14 @@ def extract_text_from_pdf(pdf_bytes):
 # --- Helper: Gemini AI से सवाल बनवाना ---
 async def generate_quiz_from_text(pdf_text: str, num_questions: int):
     prompt = f"""
-तुम एक बहुत ही सख्त प्रतियोगी परीक्षा परीक्षा विशेषज्ञ हो।
+तुम एक बहुत ही सख्त प्रतियोगी परीक्षा विशेषज्ञ हो।
 नीचे दिए गए टेक्स्ट को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) हिंदी में तैयार करो।
 
 **सख्त नियम:**
 1. उत्तर केवल और केवल नीचे दिए गए टेक्स्ट में मौजूद तथ्यों पर आधारित होने चाहिए। अपने मन या बाहर के ज्ञान से कोई उत्तर मत देना।
-2. प्रश्नों का तरीका और भाषा हर बार अलग और नई होनी चाहिए ताकि छात्र का बेहतरीन रिवीजन हो सके।
+2. प्रश्नों का तरीका और भाषा हर बार अलग और नई होना चाहिए।
 3. प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
-4. JSON संरचना बिल्कुल इस प्रारूप में होनी चाहिए (बिना किसी अतिरिक्त Markdown मान के):
+4. JSON संरचना बिल्कुल इस प्रारूप में होनी चाहिए:
 
 [
   {{
@@ -66,7 +65,7 @@ async def generate_quiz_from_text(pdf_text: str, num_questions: int):
   }}
 ]
 
-ध्यान दें: "answer" इंडेक्स 0 से 3 तक होना चाहिए जो 'options' सूची में सही विकल्प का इंडेक्स दर्शाता है।
+ध्यान दें: "answer" इंडेक्स 0 से 3 तक होना चाहिए।
 
 टेक्स्ट सामग्री:
 {pdf_text[:12000]}  
@@ -96,9 +95,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **PDF Quiz Generator Bot में आपका स्वागत है!**\n\n"
         "📖 **इस्तेमाल कैसे करें:**\n"
         "1. अपनी कोई भी **PDF फाइल** यहाँ भेजें।\n"
-        "2. नीचे दिए गए बटन से चुनें कि आपको कितने सवाल (10, 20, 30) हल करने हैं।\n"
-        "3. बॉट आपकी PDF से ताज़ा सवाल बनाकर टेस्ट शुरू कर देगा!\n\n"
-        "⚠️ *नोट: कोई भी सवाल डेटाबेस में सेव नहीं होता, हर बार बिल्कुल नए सवाल बनेंगे!*"
+        "2. नीचे दिए गए बटन से चुनें कि कितने सवाल हल करने हैं।\n"
+        "3. बॉट आपकी PDF से ताज़ा सवाल बनाकर टेस्ट शुरू कर देगा!"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
 
@@ -107,7 +105,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc.file_name.endswith('.pdf'):
         return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF डाउनलोड हो रही है और टेक्स्ट निकाला जा रहा है...")
+    msg = await update.message.reply_text("📥 PDF लोड हो रही है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -115,13 +113,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_text = extract_text_from_pdf(pdf_bytes)
 
         if not pdf_text or len(pdf_text) < 50:
-            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका। (हो सकता है यह केवल स्कैन की गई इमेज हो)।")
+            return await msg.edit_text("❌ इस PDF से टेक्स्ट नहीं पढ़ा जा सका।")
 
         user_id = update.effective_user.id
-        USER_PDF_DATA[user_id] = {
-            "text": pdf_text,
-            "filename": doc.file_name
-        }
+        USER_PDF_DATA[user_id] = {"text": pdf_text, "filename": doc.file_name}
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10")],
@@ -130,14 +125,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await msg.edit_text(
-            f"✅ **PDF सफलतापूर्वक लोड हो गई!**\n📄 फ़ाइल: `{doc.file_name}`\n\n"
-            "👇 **कितने सवालों का क्विज़ खेलना चाहते हैं? बटन पर क्लिक करें:**",
+            f"✅ **PDF लोड हो गई!**\n📄 फ़ाइल: `{doc.file_name}`\n\n"
+            "👇 **कितने सवालों का क्विज़ खेलना चाहते हैं?**",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"PDF handling error: {e}")
-        await msg.edit_text("❌ PDF प्रोसेस करने में कोई त्रुटि हुई।")
+        logger.error(f"PDF error: {e}")
+        await msg.edit_text("❌ PDF प्रोसेस करने में त्रुटि हुई।")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -151,15 +146,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         num_qs = int(data.split("_")[1])
         
         if user_id not in USER_PDF_DATA or "text" not in USER_PDF_DATA[user_id]:
-            return await query.edit_message_text("❌ PDF का डेटा नहीं मिला। कृपया फिर से PDF अपलोड करें: /start")
+            return await query.edit_message_text("❌ PDF का डेटा नहीं मिला। कृपया फिर से PDF भेजें: /start")
 
         pdf_text = USER_PDF_DATA[user_id]["text"]
-        await query.edit_message_text(f"🤖 AI आपकी PDF से {num_qs} नए सवाल तैयार कर रहा है... कृपया 5-10 सेकंड इंतज़ार करें ⏳")
+        await query.edit_message_text(f"🤖 AI आपकी PDF से {num_qs} नए सवाल बना रहा है... ⏳")
 
         quiz_data = await generate_quiz_from_text(pdf_text, num_qs)
 
         if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में कोई समस्या आई। कृपया बटन पर फिर से क्लिक करें।")
+            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। पुनः प्रयास करें।")
 
         context.user_data.clear()
         context.user_data.update({
@@ -184,12 +179,7 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = (
-            f"🎉 **क्विज़ समाप्त!**\n\n"
-            f"✅ सही उत्तर: {score} / {total}\n"
-            f"📊 आपका स्कोर: {per}%\n\n"
-            f"💡 नया टेस्ट खेलने के लिए नई PDF भेजें या फिर से /start करें।"
-        )
+        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown")
         user_data["busy"] = False
         return
@@ -238,38 +228,52 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_data["score"] += 1
         await send_next_quiz(context, chat_id, user_id)
 
-# --- WEBHOOK & MAIN ---
-async def handle_webhook(request):
-    app = request.app['bot_app']
-    if request.method == 'POST':
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
+# --- AIOHTTP WEB SERVER & WEBHOOK ---
+async def main():
+    ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    ptb_app.add_handler(CallbackQueryHandler(handle_callback))
+    ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    await ptb_app.initialize()
+    await ptb_app.start()
+
+    # Webhook सेट करना
+    webhook_url = f"{RENDER_URL}/{TOKEN}"
+    await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    logger.info(f"Webhook set to: {webhook_url}")
+
+    # Aiohttp Web Server
+    web_app = web.Application()
+
+    async def telegram_webhook(request):
+        try:
+            data = await request.json()
+            update = Update.de_json(data, ptb_app.bot)
+            await ptb_app.process_update(update)
+        except Exception as e:
+            logger.error(f"Error handling update: {e}")
         return web.Response(text="OK")
-    return web.Response(text="Bot Alive")
 
-def main():
-    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    async def health_check(request):
+        return web.Response(text="Bot Alive")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
+    web_app.router.add_post(f"/{TOKEN}", telegram_webhook)
+    web_app.router.add_get("/", health_check)
 
-    # Webhook सेटअप (Render के लिए)
     port = int(os.environ.get("PORT", 10000))
-    
-    async def on_startup(application):
-        await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}", drop_pending_updates=True)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
-    app.post_init = on_startup
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=f"{RENDER_URL}/{TOKEN}",
-        drop_pending_updates=True
-    )
+    logger.info(f"Server running on port {port}")
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
