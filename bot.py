@@ -32,7 +32,24 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Helper: Gemini AI से सवाल बनवाना ---
+# --- Gemini API Test Function ---
+async def test_gemini_api():
+    try:
+        prompt = "एक आसान सामान्य ज्ञान प्रश्न JSON प्रारूप में बनाओ। प्रारूप: [{\"question\": \"...\", \"options\": [\"a\", \"b\", \"c\", \"d\"], \"answer\": 0}]"
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.7,
+            ),
+        )
+        return True, response.text
+    except Exception as e:
+        return False, str(e)
+
+# --- Helper: Gemini AI से सवाल बनवाना (PDF/Text) ---
 async def generate_quiz_from_pdf_bytes(pdf_bytes: bytes, file_name: str, num_questions: int):
     prompt = f"""
 तुम एक बहुत ही सख्त प्रतियोगी परीक्षा विशेषज्ञ हो।
@@ -55,7 +72,6 @@ JSON प्रारूप:
 ध्यान दें: "answer" का मान 0 से 3 तक का इंडेक्स होना चाहिए।
 """
     try:
-        # PDF बाइट्स को सपोर्टेड MIME टाइप के साथ भेजना
         pdf_part = types.Part.from_bytes(
             data=pdf_bytes,
             mime_type="application/pdf",
@@ -85,18 +101,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         "👋 **PDF Quiz Generator Bot में आपका स्वागत है!**\n\n"
         "📖 **इस्तेमाल कैसे करें:**\n"
-        "1. अपनी कोई भी **PDF फ़ाइल / स्कैन दस्तावेज़** यहाँ भेजें।\n"
-        "2. नीचे दिए गए बटन से चुनें कि कितने सवाल हल करने हैं।\n"
-        "3. बॉट AI के ज़रिए फ़ाइल को समझकर तुरंत टेस्ट शुरू कर देगा!"
+        "1. अपनी कोई भी **PDF फ़ाइल** यहाँ भेजें।\n"
+        "2. फिर प्रश्नों की संख्या चुनें।\n\n"
+        "🔍 **Gemini API जाँचने के लिए:** /testgemini भेजें।"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🧪 Gemini API की जाँच की जा रही है...")
+    success, result = await test_gemini_api()
+    if success:
+        await msg.edit_text(f"✅ **Gemini API काम कर रही है!**\n\n**AI का रिस्पॉन्स:**\n`{result}`", parse_mode="Markdown")
+    else:
+        await msg.edit_text(f"❌ **Gemini API में एरर है:**\n`{result}`", parse_mode="Markdown")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith('.pdf'):
         return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF डाउनलोड और प्रोसेस हो रही है...")
+    msg = await update.message.reply_text("📥 PDF डाउनलोड हो रही है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -146,7 +170,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz_data = await generate_quiz_from_pdf_bytes(pdf_bytes, file_name, num_qs)
 
         if not quiz_data:
-            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया बटन पर फिर से क्लिक करें या छोटी PDF भेजें।")
+            return await context.bot.send_message(chat_id, "❌ सवाल बनाने में समस्या आई। कृपया `/testgemini` चलाकर देखें या फिर से प्रयास करें।")
 
         context.user_data.clear()
         context.user_data.update({
@@ -225,6 +249,7 @@ async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("testgemini", test_cmd))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     ptb_app.add_handler(CallbackQueryHandler(handle_callback))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
