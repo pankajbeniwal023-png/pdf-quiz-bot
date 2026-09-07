@@ -25,115 +25,84 @@ RENDER_URL = os.environ.get("RENDER_URL")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-QUESTION_BANK = []
-ASKED_QUESTION_IDS = set()
+# Global Data Banks
+PROCESSED_DATA = {
+    "direct": [],
+    "statement": [],
+    "twisted": []
+}
+ASKED_IDS = set()
 POLL_TRACKER = {}
 
-# --- Gemini Rephraser Engine (Updated Model: gemini-3.6-flash) ---
-async def rephrase_question_with_ai(original_q: dict, mode: str):
-    orig_question = original_q.get("question", "")
-    orig_options = original_q.get("options", [])
-    correct_idx = original_q.get("answer", 0)
-    
-    if correct_idx < len(orig_options):
-        correct_answer_text = orig_options[correct_idx]
-    else:
-        correct_answer_text = orig_options[0]
+# Batch generator to process uploaded JSON in bulk
+async def process_all_questions_in_bulk(raw_questions: list):
+    prompt = f"""
+You are an expert exam setter. Convert the provided array of quiz items into two new formats:
+1. "statement": Assertion-Reason style ("कथन (A): ... \nकारण (R): ...").
+2. "twisted": Rephrased analytical question with new sentence structure.
 
-    random_seed = random.randint(10000, 999999)
+Input Data:
+{json.dumps(raw_questions, ensure_ascii=False)}
 
-    if mode == 'statement':
-        instruction = f"""
-तुम एक बहुत ही सख्त RPSC/UPSC परीक्षा विशेषज्ञ हो।
-तुम्हें इस मूल प्रश्न को अनिवार्य रूप से "कथन (Assertion)" और "कारण (Reason)" वाले प्रश्न में बदलना है।
-
-मूल प्रश्न: {orig_question}
-सही उत्तर का मुख्य विचार: {correct_answer_text}
-
-नियम:
-1. प्रश्न को ऐसे लिखो:
-   "कथन (A): [तथ्य]
-   कारण (R): [कारण]"
-2. मूल प्रश्न की भाषा बिल्कुल मत दोहराओ।
-3. 4 विकल्प बनाओ (जैसे: A और R दोनों सही हैं..., A सही है R गलत है... आदि)।
-4. 'correct_option_text' फ़ील्ड में वही विकल्प का पूरा टेक्स्ट डालो जो 100% सही उत्तर हो।
-(Seed: {random_seed})
+Rules:
+- Keep the correct option matching the original index.
+- Output strictly valid JSON with this exact array structure:
+[
+  {{
+    "id": 0,
+    "direct": {{"question": "...", "options": [...], "answer": 0}},
+    "statement": {{"question": "...", "options": [...], "answer": 0}},
+    "twisted": {{"question": "...", "options": [...], "answer": 0}}
+  }}
+]
 """
-    else:  # twisted / varied
-        instruction = f"""
-तुम एक परीक्षा विशेषज्ञ हो। इस प्रश्न की शब्दावली, वाक्य-रचना और भाषा को पूरी तरह से घुमाकर (Twisted/Scenario-based) नया बनाओ।
-
-मूल प्रश्न: {orig_question}
-सही उत्तर: {correct_answer_text}
-
-नियम:
-1. मूल प्रश्न के शब्दों को दोहराना सख्त मना है। प्रश्न का तरीका पूरी तरह नया और विश्लेषणात्मक (Analytical) होना चाहिए।
-2. 4 नए विकल्प बनाओ।
-3. 'correct_option_text' फ़ील्ड में सही विकल्प का पूरा टेक्स्ट डालो।
-(Seed: {random_seed})
-"""
-
-    prompt = f"""{instruction}
-
-आउटपुट केवल इस JSON प्रारूप में होना चाहिए:
-{{
-  "question": "यहाँ नया घुमावदार या कथन-कारण वाला प्रश्न लिखें",
-  "options": ["विकल्प 1", "विकल्प 2", "विकल्प 3", "विकल्प 4"],
-  "correct_option_text": "यहाँ इन 4 विकल्पों में से जो सही है उसका सटीक टेक्स्ट लिखें"
-}}
-"""
-
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-3.6-flash',  # <--- अपडेटेड मॉडल नाम
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.95,
+                temperature=0.7,
             ),
         )
-        data = json.loads(response.text.strip())
-        
-        # Dynamic Answer Index Fix
-        new_options = data.get("options", [])
-        correct_text = data.get("correct_option_text", "")
-        
-        new_answer_idx = 0
-        if correct_text in new_options:
-            new_answer_idx = new_options.index(correct_text)
-
-        return {
-            "question": data.get("question", orig_question),
-            "options": new_options if len(new_options) == 4 else orig_options,
-            "answer": new_answer_idx
-        }
+        parsed = json.loads(response.text.strip())
+        return parsed
     except Exception as e:
-        logger.error(f"Rephrase Error: {e}")
-        return original_q
+        logger.error(f"Bulk Generation Error: {e}")
+        # Fallback to direct raw format if API fails during processing
+        fallback = []
+        for i, q in enumerate(raw_questions):
+            fallback.append({
+                "id": i,
+                "direct": q,
+                "statement": q,
+                "twisted": q
+            })
+        return fallback
 
-# --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🧠 **स्मार्ट रिवीज़न Quiz Bot**\n\n"
-        "1. सबसे पहले अपनी `.json` या `.txt` फ़ाइल भेजें।\n"
-        "2. फिर इन कमांड्स से अभ्यास करें:\n\n"
-        "📌 `/quiz 10` - भाषा बदलकर नए तरीके के 10 सवाल\n"
-        "📝 `/statement 10` - कथन और कारण (Assertion-Reason) वाले सवाल\n"
-        "🔄 `/twisted 10` - घुमावदार लॉजिकल सवाल\n"
-        "🧹 `/reset` - पूछे गए सवालों की हिस्ट्री साफ़ करें"
+        "🧠 **Ultra-Fast Quiz Bot**\n\n"
+        "1. `.json` या `.txt` फ़ाइल भेजें (अपलोड के समय ही AI सारे वेरिएशन्स तैयार कर लेगा)।\n"
+        "2. फिर बिना किसी देरी के तुरंत क्विज़ खेलें:\n\n"
+        "📌 `/quiz 10` - डायरेक्ट सवाल\n"
+        "📝 `/statement 10` - कथन-कारण सवाल\n"
+        "🔄 `/twisted 10` - घुमावदार सवाल\n"
+        "🧹 `/reset` - हिस्ट्री साफ़ करें"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global QUESTION_BANK, ASKED_QUESTION_IDS
+    global PROCESSED_DATA, ASKED_IDS
     doc = update.message.document
     file_name = doc.file_name.lower()
     
     if not (file_name.endswith('.json') or file_name.endswith('.txt')):
-        return await update.message.reply_text("❌ केवल .json या .txt फ़ाइल ही भेजें।")
+        return await update.message.reply_text("❌ केवल .json या .txt फ़ाइल भेजें।")
 
-    msg = await update.message.reply_text("📥 फ़ाइल लोड हो रही है...")
+    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई। AI सभी फॉर्मेट तैयार कर रहा है, कृपया प्रतीक्षा करें... ⚡")
+    
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
@@ -141,30 +110,39 @@ async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TY
         data = json.loads(text_data)
 
         if isinstance(data, list) and len(data) > 0:
-            QUESTION_BANK = data
-            ASKED_QUESTION_IDS.clear()
-            await msg.edit_text(
-                f"✅ **सफलतापूर्वक {len(QUESTION_BANK)} सवाल लोड हो गए!**\n\n"
-                "अब अभ्यास शुरू करने के लिए `/statement 5` या `/twisted 5` टाइप करें।", 
+            bulk_processed = await process_all_questions_in_bulk(data)
+            
+            PROCESSED_DATA["direct"] = [item["direct"] for item in bulk_processed]
+            PROCESSED_DATA["statement"] = [item["statement"] for item in bulk_processed]
+            PROCESSED_DATA["twisted"] = [item["twisted"] for item in bulk_processed]
+            
+            ASKED_IDS.clear()
+            
+            await status_msg.edit_text(
+                f"✅ **{len(data)} सवाल लोड हो गए!**\n\n"
+                "अब कमांड देते ही बिना किसी टाइम-लैग के क्विज़ चालू होगा:\n"
+                "👉 `/statement 5` या `/twisted 5` टाइप करें।", 
                 parse_mode="Markdown"
             )
         else:
-            await msg.edit_text("❌ फ़ाइल में डेटा सही JSON लिस्ट फॉर्मेट में नहीं है।")
+            await status_msg.edit_text("❌ फ़ाइल में वैलिड प्रश्न लिस्ट नहीं है।")
     except Exception as e:
-        logger.error(f"File Load Error: {e}")
-        await msg.edit_text("❌ फ़ाइल पढ़ने में त्रुटि हुई। कृपया फॉर्मेट चेक करें।")
+        logger.error(f"File handling error: {e}")
+        await status_msg.edit_text("❌ फ़ाइल रीड या प्रोसेस करने में एरर आई।")
 
 async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    global QUESTION_BANK, ASKED_QUESTION_IDS
-    if not QUESTION_BANK:
-        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली फ़ाइल बॉट को भेजें!")
+    global PROCESSED_DATA, ASKED_IDS
+    bank = PROCESSED_DATA.get(mode, [])
+    
+    if not bank:
+        return await update.message.reply_text("❌ पहले अपनी प्रश्नों वाली फ़ाइल अपलोड करें!")
 
-    unasked_indices = [i for i in range(len(QUESTION_BANK)) if i not in ASKED_QUESTION_IDS]
+    unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
 
     if not unasked_indices:
         return await update.message.reply_text(
-            "🎉 **आपकी फ़ाइल के सभी सवाल पूरे हो चुके हैं!**\n"
-            "फिर से शुरू करने के लिए `/reset` कमांड दें।"
+            "🎉 **सभी सवाल समाप्त हो चुके हैं!**\n"
+            "पुनः शुरू करने के लिए `/reset` करें।"
         )
 
     count = 5
@@ -173,33 +151,27 @@ async def start_quiz_session(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     selected_indices = random.sample(unasked_indices, min(count, len(unasked_indices)))
     
-    msg = await update.message.reply_text(f"⚡ AI सवाल को `{mode.upper()}` फॉर्मेट में बदल रहा है... ⏳", parse_mode="Markdown")
-
-    processed_questions = []
+    session_questions = []
     for idx in selected_indices:
-        ASKED_QUESTION_IDS.add(idx)
-        raw_q = QUESTION_BANK[idx]
-        rephrased = await rephrase_question_with_ai(raw_q, mode)
-        processed_questions.append(rephrased)
-
-    await msg.delete()
+        ASKED_IDS.add(idx)
+        session_questions.append(bank[idx])
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
     context.user_data.clear()
     context.user_data.update({
-        "quiz": processed_questions,
+        "quiz": session_questions,
         "idx": 0,
         "score": 0,
-        "total": len(processed_questions),
+        "total": len(session_questions),
         "busy": True
     })
 
     await send_next_quiz(context, chat_id, user_id)
 
 async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz_session(update, context, mode="varied")
+    await start_quiz_session(update, context, mode="direct")
 
 async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_quiz_session(update, context, mode="statement")
@@ -208,9 +180,9 @@ async def twisted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_quiz_session(update, context, mode="twisted")
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ASKED_QUESTION_IDS
-    ASKED_QUESTION_IDS.clear()
-    await update.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!**")
+    global ASKED_IDS
+    ASKED_IDS.clear()
+    await update.message.reply_text("🧹 **हिस्ट्री रीसेट कर दी गई है!**")
 
 async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     user_data = context.application.user_data.get(user_id)
@@ -224,12 +196,12 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        remaining = len(QUESTION_BANK) - len(ASKED_QUESTION_IDS)
+        remaining = len(PROCESSED_DATA["direct"]) - len(ASKED_IDS)
         res = (
-            f"🎉 **क्विज़ समाप्त!**\n\n"
+            f"🎉 **क्विज़ पूरा हुआ!**\n\n"
             f"✅ सही उत्तर: {score} / {total}\n"
             f"📊 स्कोर: {per}%\n"
-            f"📚 अभी **{remaining}** नए सवाल बाकी हैं।"
+            f"📚 शेष नए सवाल: {remaining}"
         )
         await context.bot.send_message(chat_id, res, parse_mode="Markdown")
         user_data["busy"] = False
@@ -242,8 +214,8 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
 
     msg = await context.bot.send_poll(
         chat_id=chat_id,
-        question=q_text,
-        options=options,
+        question=q_text[:300],  # Max limit for telegram question text
+        options=[opt[:100] for opt in options], # Max limit for options text
         type=Poll.QUIZ,
         correct_option_id=correct_id,
         is_anonymous=False
@@ -279,7 +251,6 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_data["score"] += 1
         await send_next_quiz(context, chat_id, user_id)
 
-# --- Server setup ---
 async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
