@@ -4,6 +4,7 @@ import logging
 import asyncio
 import random
 import warnings
+import fitz  # PyMuPDF
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import (
@@ -18,183 +19,124 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 
-# --- AFC Warning को पूरी तरह दबाने (Suppress) का फ़िक्स ---
-warnings.filterwarnings("ignore", category=UserWarning, module="google_genai")
-warnings.filterwarnings("ignore", message=".*Direct use of automatic function calling.*")
-
-# --- लॉगिंग सेटअप ---
+warnings.filterwarnings("ignore")
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- कॉन्फ़िगरेशन ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 RENDER_URL = os.environ.get("RENDER_URL")
 
-# Gemini AI क्लाइंट
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
-# --- Gemini API Test Function ---
-async def test_gemini_api():
-    try:
-        prompt = "एक आसान सामान्य ज्ञान प्रश्न JSON प्रारूप में बनाओ। प्रारूप: [{\"question\": \"...\", \"options\": [\"a\", \"b\", \"c\", \"d\"], \"answer\": 0}]"
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.7,
-            ),
-        )
-        return True, response.text
-    except Exception as e:
-        return False, str(e)
+# PDF से टेक्स्ट निकालने का फ़ंक्शन
+def extract_text_from_pdf(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text() + "\n"
+    return full_text
 
-# --- ऑटो-रीट्राई और फॉलबैक के साथ बैच जनरेटर ---
-async def fetch_single_batch(pdf_bytes: bytes, num_questions: int, batch_id: int):
-    random_seed = random.randint(10000, 999999)
+# टेक्स्ट से सवाल बनाने का फ़ंक्शन
+async def generate_questions_from_text(pdf_text, num_questions):
+    # टेक्स्ट का रैंडम हिस्सा चुनना ताकि हर बार अलग सवाल बनें
+    max_chars = 30000
+    if len(pdf_text) > max_chars:
+        start_idx = random.randint(0, len(pdf_text) - max_chars)
+        selected_text = pdf_text[start_idx : start_idx + max_chars]
+    else:
+        selected_text = pdf_text
+
+    random_seed = random.randint(1000, 99999)
     prompt = f"""
-तुम एक बहुत ही सख्त और कुशल परीक्षा विशेषज्ञ हो।
-इस PDF फाइल को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) आसान व स्पष्ट हिंदी में बनाओ।
+तुम एक परीक्षा विशेषज्ञ हो। नीचे दिए गए अध्ययन टेक्स्ट को ध्यान से पढ़ो और ठीक {num_questions} बहुविकल्पीय प्रश्न (MCQs) शुद्ध एवं सरल हिंदी भाषा में बनाओ।
 
-**सख्त नियम:**
-1. **रैंडमनेस (Batch {batch_id}, Seed {random_seed}):** PDF के अलग-अलग अध्यायों और टॉपिक्स से अनूठे सवाल चुनो।
-2. **सटीक विकल्प:** प्रत्येक प्रश्न के ठीक 4 विकल्प होने चाहिए।
-3. **आउटपुट:** केवल और केवल शुद्ध JSON Array होना चाहिए।
+**नियम:**
+1. (Seed: {random_seed}) हर बार नए, अलग और महत्वपूर्ण फैक्ट्स से सवाल चुनो।
+2. प्रत्येक प्रश्न के 4 स्पष्ट विकल्प हों।
+3. केवल शुद्ध JSON Array आउटपुट दो।
 
 JSON प्रारूप:
 [
   {{
-    "question": "प्रश्न का पाठ",
-    "options": ["विकल्प 1", "विकल्प 2", "विकल्प 3", "विकल्प 4"],
+    "question": "प्रश्न?",
+    "options": ["ऑप्शन 1", "ऑप्शन 2", "ऑप्शन 3", "ऑप्शन 4"],
     "answer": 0
   }}
 ]
+
+टेक्स्ट:
+{selected_text}
 """
-    # 503 / Server Error से बचने के लिए Retries और Fallback Models
+
     models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash']
-    max_retries = 3
-
     for model_name in models_to_try:
-        for attempt in range(max_retries):
-            try:
-                pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-                
-                config = types.GenerateContentConfig(
+        try:
+            response = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.8,
-                )
+                    temperature=0.9,
+                ),
+            )
+            raw_text = response.text.strip()
+            if raw_text.startswith("```json"):
+                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+            elif raw_text.startswith("```"):
+                raw_text = raw_text.replace("```", "").strip()
 
-                response = await asyncio.to_thread(
-                    ai_client.models.generate_content,
-                    model=model_name,
-                    contents=[pdf_part, prompt],
-                    config=config,
-                )
-                
-                raw_text = response.text.strip()
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                elif raw_text.startswith("```"):
-                    raw_text = raw_text.replace("```", "").strip()
-
-                data = json.loads(raw_text)
-                if isinstance(data, list) and len(data) > 0:
-                    return data
-
-            except Exception as e:
-                err_str = str(e)
-                logger.warning(f"Batch {batch_id} (Attempt {attempt+1}, Model {model_name}) Failed: {err_str}")
-                
-                # यदि 503 ओवरलोड की समस्या है तो थोड़ा रुककर फिर प्रयास करें
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    await asyncio.sleep(2 * (attempt + 1))
-                else:
-                    break  # अन्य त्रुटि पर तुरंत अगला मॉडल ट्राइ करें
+            data = json.loads(raw_text)
+            if isinstance(data, list) and len(data) > 0:
+                return data
+        except Exception as e:
+            logger.warning(f"Model {model_name} Error: {e}")
+            await asyncio.sleep(1)
 
     return []
 
-# --- पैरेलल बैच जनरेटर ---
-async def generate_quiz_parallel(pdf_bytes: bytes, total_questions: int):
-    batch_size = 20 if total_questions <= 50 else 25
-    tasks = []
-    
-    remaining = total_questions
-    batch_id = 1
-    while remaining > 0:
-        current_batch = min(batch_size, remaining)
-        tasks.append(fetch_single_batch(pdf_bytes, current_batch, batch_id))
-        remaining -= current_batch
-        batch_id += 1
-
-    results = await asyncio.gather(*tasks)
-    
-    all_questions = []
-    for q_list in results:
-        all_questions.extend(q_list)
-
-    random.shuffle(all_questions)
-    return all_questions[:total_questions]
-
-# --- बॉट कमांड्स ---
+# --- टेलीग्राम हैंडलर्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in USER_PDF_DATA:
         del USER_PDF_DATA[user_id]
-    
-    welcome_msg = (
-        "👋 **PDF Quiz Generator Bot में आपका स्वागत है!**\n\n"
-        "📖 **इस्तेमाल कैसे करें:**\n"
-        "1. अपनी कोई भी **PDF फ़ाइल** यहाँ भेजें।\n"
-        "2. फिर प्रश्नों की संख्या चुनें (10 से 200 तक)।\n\n"
-        "🔍 **Gemini API जाँचने के लिए:** /testgemini भेजें।"
-    )
-    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
-
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🧪 Gemini API की जाँच की जा रही है...")
-    success, result = await test_gemini_api()
-    if success:
-        await msg.edit_text(f"✅ **Gemini API काम कर रही है!**\n\n**AI का रिस्पॉन्स:**\n`{result}`", parse_mode="Markdown")
-    else:
-        await msg.edit_text(f"❌ **Gemini API में एरर है:**\n`{result}`", parse_mode="Markdown")
+    await update.message.reply_text("👋 **PDF Revision Bot**\nअपनी PDF फ़ाइल यहाँ भेजें।")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith('.pdf'):
-        return await update.message.reply_text("❌ कृपया केवल PDF फ़ाइल ही भेजें।")
+        return await update.message.reply_text("❌ केवल PDF भेजें।")
 
-    msg = await update.message.reply_text("📥 PDF डाउनलोड हो रही है...")
+    msg = await update.message.reply_text("📥 PDF पढ़ी जा रही है...")
     
     try:
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
+        
+        # PDF से तुरंत टेक्स्ट निकालें
+        pdf_text = extract_text_from_pdf(bytes(pdf_bytes))
+
+        if not pdf_text.strip():
+            return await msg.edit_text("❌ इस PDF में टेक्स्ट नहीं मिला (हो सकता है यह केवल स्कैन की गई इमेजेस हों)।")
 
         user_id = update.effective_user.id
         USER_PDF_DATA[user_id] = {
-            "bytes": bytes(pdf_bytes),
+            "text": pdf_text,
             "filename": doc.file_name
         }
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10"), InlineKeyboardButton("🔥 25 Questions", callback_data="gen_25")],
-            [InlineKeyboardButton("⚡ 50 Questions", callback_data="gen_50"), InlineKeyboardButton("🚀 100 Questions", callback_data="gen_100")],
-            [InlineKeyboardButton("🏆 200 Questions", callback_data="gen_200")]
+            [InlineKeyboardButton("🎯 10 Questions", callback_data="gen_10"), InlineKeyboardButton("🔥 20 Questions", callback_data="gen_20")],
+            [InlineKeyboardButton("⚡ 30 Questions", callback_data="gen_30"), InlineKeyboardButton("🚀 50 Questions", callback_data="gen_50")]
         ])
 
-        await msg.edit_text(
-            f"✅ **PDF सफलतापूर्वक लोड हो गई!**\n📄 फ़ाइल: `{doc.file_name}`\n\n"
-            "👇 **कितने सवालों का क्विज़ खेलना चाहते हैं?**",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(f"✅ **PDF लोड हो गई!**\n📄 `{doc.file_name}`\n\nकितने सवालों से रिवीजन करना है?", reply_markup=keyboard, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"PDF Handling Error: {e}", exc_info=True)
-        await msg.edit_text("❌ PDF लोड करने में त्रुटि हुई। कृपया फिर से प्रयास करें।")
+        logger.error(f"Error: {e}")
+        await msg.edit_text("❌ PDF प्रोसेस करने में समस्या आई।")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -207,17 +149,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("gen_"):
         num_qs = int(data.split("_")[1])
         
-        if user_id not in USER_PDF_DATA or "bytes" not in USER_PDF_DATA[user_id]:
-            return await query.edit_message_text("❌ PDF का डेटा नहीं मिला। कृपया फिर से PDF भेजें: /start")
+        if user_id not in USER_PDF_DATA or "text" not in USER_PDF_DATA[user_id]:
+            return await query.edit_message_text("❌ PDF डेटा नहीं मिला। फिर से PDF भेजें: /start")
 
-        pdf_bytes = USER_PDF_DATA[user_id]["bytes"]
-        
-        await query.edit_message_text(f"🚀 AI से {num_qs} नए सवाल तैयार किए जा रहे हैं... ⏳")
+        pdf_text = USER_PDF_DATA[user_id]["text"]
+        await query.edit_message_text(f"⚡ PDF से {num_qs} नए सवाल तैयार हो रहे हैं... ⏳")
 
-        quiz_data = await generate_quiz_parallel(pdf_bytes, num_qs)
+        quiz_data = await generate_questions_from_text(pdf_text, num_qs)
 
-        if not quiz_data or len(quiz_data) == 0:
-            return await context.bot.send_message(chat_id, "❌ सर्वर व्यस्त होने के कारण सवाल जनरेट नहीं हो सके। कृपया दोबारा कोशिश करें।")
+        if not quiz_data:
+            return await context.bot.send_message(chat_id, "❌ सर्वर रिस्पॉन्स नहीं दे पाया। कृपया बटन दोबारा दबाएँ।")
 
         context.user_data.clear()
         context.user_data.update({
@@ -242,7 +183,7 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
+        res = f"🎉 **रिवीजन क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score} / {total}\n📊 आपका स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown")
         user_data["busy"] = False
         return
@@ -291,12 +232,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_data["score"] += 1
         await send_next_quiz(context, chat_id, user_id)
 
-# --- AIOHTTP WEB SERVER & WEBHOOK ---
 async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("testgemini", test_cmd))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     ptb_app.add_handler(CallbackQueryHandler(handle_callback))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
@@ -315,7 +254,7 @@ async def main():
             update = Update.de_json(data, ptb_app.bot)
             await ptb_app.process_update(update)
         except Exception as e:
-            logger.error(f"Error handling update: {e}")
+            logger.error(f"Error: {e}")
         return web.Response(text="OK")
 
     async def health_check(request):
