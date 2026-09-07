@@ -63,7 +63,7 @@ JSON प्रारूप:
 
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=[pdf_part, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
