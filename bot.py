@@ -29,7 +29,6 @@ RENDER_URL = os.environ.get("RENDER_URL")
 # Gemini AI क्लाइंट
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# मेमोरी स्टोर
 USER_PDF_DATA = {}
 POLL_TRACKER = {}
 
@@ -50,7 +49,7 @@ async def test_gemini_api():
     except Exception as e:
         return False, str(e)
 
-# --- सिंगल बैच से सवाल जनरेट करने का फ़ंक्शन ---
+# --- सिंगल बैच जनरेटर (No-AFC Fix Added) ---
 async def fetch_single_batch(pdf_bytes: bytes, num_questions: int, batch_id: int):
     random_seed = random.randint(10000, 999999)
     prompt = f"""
@@ -73,15 +72,21 @@ JSON प्रारूप:
 """
     try:
         pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+        
+        # AFC (Automatic Function Calling) बंद करने के लिए config
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.9,
+            tools=[],  # tools खाली करके AFC डिसेबल किया
+        )
+
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model='gemini-3.6-flash',
             contents=[pdf_part, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.9,
-            ),
+            config=config,
         )
+        
         raw_text = response.text.strip()
         if raw_text.startswith("```json"):
             raw_text = raw_text.replace("```json", "").replace("```", "").strip()
@@ -95,9 +100,8 @@ JSON प्रारूप:
         logger.error(f"Batch {batch_id} Error: {e}")
     return []
 
-# --- 100-200 सवालों के लिए पैरेलल बैच जनरेटर ---
+# --- पैरेलल बैच जनरेटर ---
 async def generate_quiz_parallel(pdf_bytes: bytes, total_questions: int):
-    # अधिकतम 25 सवालों के टुकड़ों में बांटना
     batch_size = 20 if total_questions <= 50 else 25
     tasks = []
     
@@ -109,14 +113,12 @@ async def generate_quiz_parallel(pdf_bytes: bytes, total_questions: int):
         remaining -= current_batch
         batch_id += 1
 
-    # सभी पैरेलल ऑर्डर्स को एक साथ चलाएँ
     results = await asyncio.gather(*tasks)
     
     all_questions = []
     for q_list in results:
         all_questions.extend(q_list)
 
-    # सवालों को शफ़ल करें
     random.shuffle(all_questions)
     return all_questions[:total_questions]
 
@@ -131,7 +133,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 **इस्तेमाल कैसे करें:**\n"
         "1. अपनी कोई भी **PDF फ़ाइल** यहाँ भेजें।\n"
         "2. फिर प्रश्नों की संख्या चुनें (10 से 200 तक)।\n\n"
-        "⚡ **सुपर-फ़ास्ट पैरेलल AI स्पीड के साथ!**\n"
         "🔍 **Gemini API जाँचने के लिए:** /testgemini भेजें।"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
@@ -193,7 +194,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pdf_bytes = USER_PDF_DATA[user_id]["bytes"]
         
-        await query.edit_message_text(f"🚀 पैरेलल AI इंजन सक्रिय! {num_qs} नए सवाल तैयार किए जा रहे हैं... ⏳")
+        await query.edit_message_text(f"🚀 AI से {num_qs} नए सवाल तैयार किए जा रहे हैं... ⏳")
 
         quiz_data = await generate_quiz_parallel(pdf_bytes, num_qs)
 
