@@ -29,7 +29,7 @@ QUESTION_BANK = []
 ASKED_QUESTION_IDS = set()
 POLL_TRACKER = {}
 
-# --- Gemini Rephraser Engine (Forced Transformation) ---
+# --- Gemini Rephraser Engine (Updated Active Model) ---
 async def rephrase_question_with_ai(original_q: dict, mode: str):
     orig_question = original_q.get("question", "")
     orig_options = original_q.get("options", [])
@@ -86,7 +86,7 @@ async def rephrase_question_with_ai(original_q: dict, mode: str):
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',  # 404 Not Found एरर फिक्स करने के लिए वर्किंग मॉडल
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -115,7 +115,7 @@ async def rephrase_question_with_ai(original_q: dict, mode: str):
 # --- बॉट कमांड्स ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🧠 **स्मार्ट रिवीज़न Quiz Bot (Fixed Version)**\n\n"
+        "🧠 **स्मार्ट रिवीज़न Quiz Bot**\n\n"
         "1. सबसे पहले अपनी `.json` या `.txt` फ़ाइल भेजें।\n"
         "2. फिर इन कमांड्स से अभ्यास करें:\n\n"
         "📌 `/quiz 10` - भाषा बदलकर नए तरीके के 10 सवाल\n"
