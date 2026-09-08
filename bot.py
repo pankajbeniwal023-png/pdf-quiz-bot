@@ -21,8 +21,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # AI Client Setup
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ⚠️ UPDATED: Working Flash Model
-MODEL_NAME = "gemini-2.5-flash"
+# ⚠️ FIXED: Updated exact model name as required by Google API
+MODEL_NAME = "gemini-3.6-flash"
 
 USER_DATA = {}
 
