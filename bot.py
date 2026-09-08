@@ -1,22 +1,22 @@
-import os, json, random, asyncio, logging
+import os, json, random, asyncio, logging, re
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 
-# लॉगिंग (एरर चेक करने के लिए)
+# --- Logging ---
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Environment Variables
+# --- Config ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-USER_DATA = {}
+USER_DATA = {} # फाइल्स स्टोर करने के लिए
 
-# --- Render के लिए वेब सर्वर ---
-async def handle_root(request): return web.Response(text="Bot Alive")
+# --- Render Alive Server ---
+async def handle_root(request): return web.Response(text="Revision Bot is Live!")
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_root)
@@ -25,122 +25,118 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     await web.TCPSite(runner, "0.0.0.0", port).start()
 
-# --- फाइल हैंडलर (JSON और TXT दोनों के लिए) ---
+# --- File Handling ---
 async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     doc = update.message.document
     
-    # अब .json और .txt दोनों स्वीकार करेगा
-    if not doc.file_name.lower().endswith(('.json', '.txt')):
-        return await update.message.reply_text("❌ कृपया .json या .txt फाइल भेजें।")
-
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
-        data = json.loads(content.decode('utf-8'))
+        raw_data = json.loads(content.decode('utf-8'))
 
-        # स्मार्ट चेकिंग: अगर लिस्ट किसी key के अंदर है तो उसे निकालो
-        if isinstance(data, dict):
-            for key in data:
-                if isinstance(data[key], list):
-                    data = data[key]
+        # आपके JSON फॉर्मेट (Key -> List) को हैंडल करना
+        if isinstance(raw_data, dict):
+            # पहला key ढूंढो जिसमें list हो
+            for key in raw_data:
+                if isinstance(raw_data[key], list):
+                    USER_DATA[user_id] = raw_data[key]
                     break
+        elif isinstance(raw_data, list):
+            USER_DATA[user_id] = raw_data
         
-        if not isinstance(data, list):
-            return await update.message.reply_text("❌ फाइल का फॉर्मेट सही नहीं है।")
+        if user_id not in USER_DATA or not USER_DATA[user_id]:
+            return await update.message.reply_text("❌ फाइल में सवाल नहीं मिले। फॉर्मेट चेक करें।")
 
-        USER_DATA[user_id] = data
-        
         keyboard = [
-            [InlineKeyboardButton("🎯 MCQ Mode", callback_data="mode_mcq")],
+            [InlineKeyboardButton("🎯 MCQ (भाषा बदलें)", callback_data="mode_twisted")],
             [InlineKeyboardButton("🔄 Reverse Quiz (उल्टा)", callback_data="mode_reverse")],
-            [InlineKeyboardButton("🧩 Fill Blanks", callback_data="mode_fill")]
+            [InlineKeyboardButton("📝 Statement (कथन/कारण)", callback_data="mode_statement")],
+            [InlineKeyboardButton("🧩 Fill Blanks (रिक्त स्थान)", callback_data="mode_fill")]
         ]
         await update.message.reply_text(
-            f"✅ **{len(data)} सवाल लोड हो गए!**\n\nअब नीचे से रिविजन का तरीका चुनें:",
+            f"✅ **{len(USER_DATA[user_id])} सवाल लोड हो गए!**\n\nअब रिविजन का स्टाइल चुनें (हर बार नया सवाल मिलेगा):",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"File Error: {e}")
-        await update.message.reply_text("❌ फाइल पढ़ने में गड़बड़ हुई। चेक करें कि वह सही JSON है या नहीं।")
+        logging.error(f"Error: {e}")
+        await update.message.reply_text("❌ फाइल पढ़ने में त्रुटि। पक्का करें कि फाइल सही JSON है।")
 
-# --- AI से सवाल बनवाना ---
-async def generate_smart_question(user_id, mode):
-    if user_id not in USER_DATA: return None
-    
+# --- AI Question Generator ---
+async def generate_question(user_id, mode):
     item = random.choice(USER_DATA[user_id])
     original_q = item.get('question', '')
     options = item.get('options', [])
-    ans_idx = item.get('answer', 0)
-    correct_opt = options[ans_idx] if options else ""
+    correct_opt = options[item.get('answer', 0)]
 
-    # AI के लिए प्रॉम्प्ट
     prompts = {
-        "mode_mcq": f"इस सवाल को कठिन बनाओ: '{original_q}'। सही जवाब '{correct_opt}' ही रहे।",
-        "mode_reverse": f"उल्टा क्विज़: सवाल में मुख्य शब्द '{correct_opt}' दिखाओ। विकल्पों में 4 विवरण दो जिसमें से एक '{original_q}' पर आधारित हो।",
-        "mode_fill": f"वाक्य: '{original_q}'। उत्तर: '{correct_opt}'। इसे रिक्त स्थान वाले सवाल में बदलो।"
+        "mode_twisted": f"इस सवाल को कठिन हिंदी शब्दों और घुमावदार भाषा में दोबारा लिखो: '{original_q}'। उत्तर '{correct_opt}' ही रहे।",
+        "mode_reverse": f"उल्टा क्विज़: सवाल में मुख्य शब्द '{correct_opt}' दिखाओ। विकल्पों में 4 विवरण (Descriptions) दो जिसमें से एक '{original_q}' से मेल खाता हो।",
+        "mode_statement": f"कथन-कारण (Assertion-Reason) स्टाइल में सवाल बनाओ। कथन: '{original_q}', कारण: '{correct_opt}' के आधार पर।",
+        "mode_fill": f"सवाल '{original_q}' का उपयोग करके एक 'रिक्त स्थान' वाला वाक्य बनाओ जहाँ '{correct_opt}' सही उत्तर हो।"
     }
 
-    prompt = f"""
-    तुम एक परीक्षा एक्सपर्ट हो। केवल इस डेटा का उपयोग करो: सवाल='{original_q}', जवाब='{correct_opt}'।
-    कार्य: {prompts.get(mode, "MCQ बनाओ")}
-    नियम: केवल देवनागरी हिंदी। 100% सही उत्तर। 
-    JSON फॉर्मेट: {{"q": "सवाल", "o": ["विकल्प1", "विकल्प2", "विकल्प3", "विकल्प4"], "a": index}}
+    instruction = f"""
+    तुम एक कठिन परीक्षा के पेपर सेटर हो। केवल इस डेटा का उपयोग करो: सवाल='{original_q}', उत्तर='{correct_opt}'।
+    स्टाइल: {prompts[mode]}
+    नियम: 
+    1. भाषा देवनागरी हिंदी हो। 
+    2. अपना कोई बाहर का ज्ञान न जोड़ें, जो डेटा में है वही रहे।
+    3. विकल्प आपस में मिलते-जुलते (Confusing) बनाएं।
+    4. JSON फॉर्मेट: {{"q": "सवाल", "o": ["विकल्प1", "विकल्प2", "विकल्प3", "विकल्प4"], "a": index}}
     """
     
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.8)
+            contents=instruction,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=1.0)
         )
         return json.loads(response.text.strip())
-    except Exception as e:
-        logging.error(f"AI Error: {e}")
-        return None
+    except:
+        # Fallback: अगर AI फेल हो तो ओरिजिनल सवाल दिखाएं
+        return {"q": original_q, "o": options, "a": item.get('answer', 0)}
 
-# --- बटन क्लिक हैंडलर ---
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Callback Handler ---
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
     mode = query.data
 
     if user_id not in USER_DATA:
-        return await query.message.reply_text("❌ आपकी फाइल डिलीट हो गई है, कृपया दोबारा भेजें।")
+        return await query.message.reply_text("❌ पहले फाइल भेजें।")
 
-    # बटन दबते ही मैसेज बदलें ताकि यूजर को पता चले कि काम हो रहा है
-    await query.edit_message_text(text="🤔 AI सवाल तैयार कर रहा है... कृपया प्रतीक्षा करें।")
+    # मैसेज अपडेट ताकि यूजर को लगे काम हो रहा है
+    await query.edit_message_text(text="⚡ AI नया सवाल तैयार कर रहा है...")
     
-    q_data = await generate_smart_question(user_id, mode)
+    q_data = await generate_question(user_id, mode)
     
     if q_data:
         try:
             await context.bot.send_poll(
                 chat_id=query.message.chat_id,
                 question=q_data['q'][:300],
-                options=[str(opt)[:100] for opt in q_data['o']],
+                options=[str(o)[:100] for o in q_data['o']],
                 correct_option_id=int(q_data['a']),
                 type=Poll.QUIZ,
                 is_anonymous=False
             )
-            # अगला सवाल बटन
-            keyboard = [[InlineKeyboardButton("अगला सवाल ➡️", callback_data=mode)]]
-            await context.bot.send_message(query.message.chat_id, "अगला सवाल पाने के लिए दबाएँ:", reply_markup=InlineKeyboardMarkup(keyboard))
+            # अगला सवाल बटन ताकि लूप बना रहे
+            nxt_kb = [[InlineKeyboardButton("अगला सवाल ➡️", callback_data=mode)]]
+            await context.bot.send_message(query.message.chat_id, "तैयार रहें!", reply_markup=InlineKeyboardMarkup(nxt_kb))
         except Exception as e:
-            await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में तकनीकी समस्या आई।")
-    else:
-        await context.bot.send_message(query.message.chat_id, "❌ AI जवाब नहीं दे पाया। दोबारा कोशिश करें।")
+            await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में गड़बड़। कृपया फिर दबाएँ।")
 
-# --- मुख्य फंक्शन ---
+# --- Main App ---
 async def main():
     await start_web_server()
     app = Application.builder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("नमस्ते! अपनी फाइल भेजें।")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("नमस्ते! अपनी JSON/TXT फाइल भेजें।")))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(button_click))
     
     async with app:
         await app.initialize()
