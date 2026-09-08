@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import asyncio  # 👈 यह मिसिंग था, अब जोड़ दिया गया है
 import logging
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,7 +27,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# Logic Generator
+# Logic Generator (No AI Required)
 def generate_smart_question(item, mode):
     orig_q = item.get('question', '').strip()
     options = list(item.get('options', []))
