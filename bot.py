@@ -1,14 +1,10 @@
 import os
 import json
 import random
-import asyncio
 import logging
-import re
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
 
 # --- Logging ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -16,19 +12,11 @@ logger = logging.getLogger(__name__)
 
 # --- Config ---
 TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# AI Client Setup
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# ⚠️ FIXED: Updated exact model name as required by Google API
-MODEL_NAME = "gemini-3.6-flash"
-
 USER_DATA = {}
 
 # --- Render Port Binding ---
 async def handle_root(request):
-    return web.Response(text="Revision Bot Active")
+    return web.Response(text="Logic Revision Bot Active")
 
 async def start_web_server():
     app = web.Application()
@@ -39,6 +27,59 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+# --- Custom Question Generator (NO AI REQUIRED) ---
+def generate_smart_question(item, mode):
+    orig_q = item.get('question', '').strip()
+    options = list(item.get('options', []))
+    correct_idx = item.get('answer', 0)
+    
+    if not orig_q or not options:
+        return None
+
+    correct_val = options[correct_idx] if correct_idx < len(options) else options[0]
+
+    # 1. TWISTED MODE (कठिन/परीक्षा पैटर्न)
+    if mode == "mode_twisted":
+        prefixes = [
+            "गंभीरतापूर्वक विचार कीजिए: ",
+            "परीक्षा दृष्टिकोण से सही तथ्य चुनिए: ",
+            "निम्न संदर्भ में कौन-सा कथन सर्वथा उपयुक्त है? - ",
+            "विषय-वस्तु के आधार पर सही विकल्प का चयन करें: "
+        ]
+        new_q = f"{random.choice(prefixes)}{orig_q}"
+
+    # 2. REVERSE MODE (उल्टा/पहेली क्विज़)
+    elif mode == "mode_reverse":
+        templates = [
+            f"यदि अंतिम उत्तर '{correct_val}' है, तो यह किस संदर्भ या प्रश्न को निरूपित करता है?",
+            f"पहचान कीजिए: वह कौन-सा उत्तर है जो मूल रूप से '{orig_q}' से संबंधित है?",
+            f"संदर्भ: '{orig_q}' -> इस व्याख्या का सटीक बिंदु क्या होगा?"
+        ]
+        new_q = random.choice(templates)
+
+    # 3. STATEMENT & REASON MODE (कथन एवं कारण)
+    elif mode == "mode_statement":
+        reasons = [
+            f"कथन (A): {orig_q}\nकारण (R): इसका सीधा संबंध '{correct_val}' के मूलभूत सिद्धांतों से है।",
+            f"कथन (A): परीक्षा संदर्भ में '{orig_q}' एक मुख्य बिंदु है।\nकारण (R): क्योंकि इसका सही निरूपण '{correct_val}' द्वारा होता है।",
+            f"कथन (A): {orig_q}\nतर्क (R): दिए गए विकल्पों में से '{correct_val}' ही इसे पूर्णतः सिद्ध करता है।"
+        ]
+        new_q = random.choice(reasons)
+
+    else:
+        new_q = orig_q
+
+    # Shuffle Options randomly so correct answer position changes every time
+    shuffled_options = options.copy()
+    random.shuffle(shuffled_options)
+    new_correct_idx = shuffled_options.index(correct_val)
+
+    return {
+        "q": new_q,
+        "o": shuffled_options,
+        "a": new_correct_idx
+    }
+
 # --- File Handling ---
 async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -48,7 +89,6 @@ async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content = await file.download_as_bytearray()
         data = json.loads(content.decode('utf-8'))
 
-        # JSON Format Fix
         if isinstance(data, dict):
             for key in data:
                 if isinstance(data[key], list):
@@ -63,56 +103,12 @@ async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📝 कथन/कारण (Statement)", callback_data="mode_statement")]
         ]
         await update.message.reply_text(
-            f"✅ {len(data)} सवाल लोड हुए!\n\nAI अब हर बार नए शब्दों का प्रयोग करेगा।", 
+            f"✅ {len(data)} सवाल सफलतापूर्वक लोड हुए!\n\nअब आप बिना AI के नए पैटर्न में टेस्ट दे सकते हैं।", 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
         logger.error(f"Doc error: {e}")
         await update.message.reply_text("❌ JSON फाइल का फॉर्मेट सही नहीं है।")
-
-# --- AI Generation Logic ---
-async def generate_ai_question(user_id, mode):
-    item = random.choice(USER_DATA[user_id])
-    orig_q = item.get('question', '')
-    options = item.get('options', [])
-    correct_idx = item.get('answer', 0)
-    
-    correct_val = options[correct_idx] if isinstance(correct_idx, int) and correct_idx < len(options) else options[0]
-
-    prompts = {
-        "mode_twisted": f"इस प्रश्न की भाषा को बिल्कुल नए और कठिन हिंदी शब्दों में बदलो। प्रश्न का अर्थ वही रहे पर शब्द एकदम अलग हों। प्रश्न: '{orig_q}'",
-        "mode_reverse": f"उत्तर '{correct_val}' है। इस शब्द के लिए एक बहुत ही कठिन पहेलीनुमा विवरण लिखो जो '{orig_q}' पर आधारित हो।",
-        "mode_statement": f"कथन: '{orig_q}'। इसके लिए एक नया 'कारण' (Reason) लिखो जो सही जवाब '{correct_val}' को सिद्ध करे।"
-    }
-
-    prompt = f"""
-तुम एक परीक्षा विशेषज्ञ हो। केवल इस डेटा का उपयोग करो: सवाल='{orig_q}', जवाब='{correct_val}'।
-कार्य: {prompts[mode]}
-नियम:
-1. भाषा: उच्च स्तरीय देवनागरी हिंदी। 
-2. हर बार नए पर्यायवाची शब्दों का प्रयोग करें।
-3. आउटपुट केवल शुद्ध JSON: {{"q": "सवाल", "o": ["विकल्प1", "विकल्प2", "विकल्प3", "विकल्प4"], "a": index_number}}
-"""
-
-    try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.9,
-            )
-        )
-        res_text = response.text.strip()
-        if "```json" in res_text:
-            match = re.search(r'```json\s*(.*?)\s*```', res_text, re.DOTALL)
-            if match:
-                res_text = match.group(1)
-        return json.loads(res_text)
-    except Exception as e:
-        logger.error(f"AI Generation Error: {e}")
-        return None
 
 # --- Button Handler ---
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,11 +120,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in USER_DATA:
         return await query.message.reply_text("❌ फाइल दोबारा भेजें।")
 
-    await query.edit_message_text(text="⚡ AI भाषा बदल रहा है...")
+    item = random.choice(USER_DATA[user_id])
+    q_data = generate_smart_question(item, mode)
 
-    q_data = await generate_ai_question(user_id, mode)
-
-    if q_data and 'q' in q_data and 'o' in q_data and 'a' in q_data:
+    if q_data:
         try:
             await context.bot.send_poll(
                 chat_id=query.message.chat_id,
@@ -142,16 +137,16 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(query.message.chat_id, "तैयार?", reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception as e:
             logger.error(f"Poll Send Error: {e}")
-            await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में गड़बड़ हुई।")
+            await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में समस्या आई।")
     else:
-        await context.bot.send_message(query.message.chat_id, "❌ AI एरर। कृपया दोबारा बटन दबाएँ।")
+        await context.bot.send_message(query.message.chat_id, "❌ सवाल जनरेट नहीं हो सका।")
 
 # --- Main ---
 async def main():
     await start_web_server()
     app = Application.builder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("फाइल भेजें!")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("अपनी JSON फाइल भेजें!")))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
     app.add_handler(CallbackQueryHandler(button_click))
 
