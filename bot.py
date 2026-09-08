@@ -6,15 +6,14 @@ from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# --- Logging ---
+# Logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Config ---
 TOKEN = os.environ.get("BOT_TOKEN")
 USER_DATA = {}
 
-# --- Render Port Binding ---
+# Web Server for Render Port Binding
 async def handle_root(request):
     return web.Response(text="Logic Revision Bot Active")
 
@@ -27,7 +26,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- Custom Question Generator (NO AI REQUIRED) ---
+# Logic Generator
 def generate_smart_question(item, mode):
     orig_q = item.get('question', '').strip()
     options = list(item.get('options', []))
@@ -38,30 +37,24 @@ def generate_smart_question(item, mode):
 
     correct_val = options[correct_idx] if correct_idx < len(options) else options[0]
 
-    # 1. TWISTED MODE (कठिन/परीक्षा पैटर्न)
     if mode == "mode_twisted":
         prefixes = [
             "गंभीरतापूर्वक विचार कीजिए: ",
             "परीक्षा दृष्टिकोण से सही तथ्य चुनिए: ",
-            "निम्न संदर्भ में कौन-सा कथन सर्वथा उपयुक्त है? - ",
-            "विषय-वस्तु के आधार पर सही विकल्प का चयन करें: "
+            "निम्न संदर्भ में कौन-सा कथन सर्वथा उपयुक्त है? - "
         ]
         new_q = f"{random.choice(prefixes)}{orig_q}"
 
-    # 2. REVERSE MODE (उल्टा/पहेली क्विज़)
     elif mode == "mode_reverse":
         templates = [
             f"यदि अंतिम उत्तर '{correct_val}' है, तो यह किस संदर्भ या प्रश्न को निरूपित करता है?",
-            f"पहचान कीजिए: वह कौन-सा उत्तर है जो मूल रूप से '{orig_q}' से संबंधित है?",
-            f"संदर्भ: '{orig_q}' -> इस व्याख्या का सटीक बिंदु क्या होगा?"
+            f"पहचान कीजिए: वह कौन-सा उत्तर है जो मूल रूप से '{orig_q}' से संबंधित है?"
         ]
         new_q = random.choice(templates)
 
-    # 3. STATEMENT & REASON MODE (कथन एवं कारण)
     elif mode == "mode_statement":
         reasons = [
             f"कथन (A): {orig_q}\nकारण (R): इसका सीधा संबंध '{correct_val}' के मूलभूत सिद्धांतों से है।",
-            f"कथन (A): परीक्षा संदर्भ में '{orig_q}' एक मुख्य बिंदु है।\nकारण (R): क्योंकि इसका सही निरूपण '{correct_val}' द्वारा होता है।",
             f"कथन (A): {orig_q}\nतर्क (R): दिए गए विकल्पों में से '{correct_val}' ही इसे पूर्णतः सिद्ध करता है।"
         ]
         new_q = random.choice(reasons)
@@ -69,7 +62,6 @@ def generate_smart_question(item, mode):
     else:
         new_q = orig_q
 
-    # Shuffle Options randomly so correct answer position changes every time
     shuffled_options = options.copy()
     random.shuffle(shuffled_options)
     new_correct_idx = shuffled_options.index(correct_val)
@@ -80,7 +72,6 @@ def generate_smart_question(item, mode):
         "a": new_correct_idx
     }
 
-# --- File Handling ---
 async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     doc = update.message.document
@@ -103,14 +94,13 @@ async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📝 कथन/कारण (Statement)", callback_data="mode_statement")]
         ]
         await update.message.reply_text(
-            f"✅ {len(data)} सवाल सफलतापूर्वक लोड हुए!\n\nअब आप बिना AI के नए पैटर्न में टेस्ट दे सकते हैं।", 
+            f"✅ {len(data)} सवाल सफलतापूर्वक लोड हुए!", 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
         logger.error(f"Doc error: {e}")
         await update.message.reply_text("❌ JSON फाइल का फॉर्मेट सही नहीं है।")
 
-# --- Button Handler ---
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -136,17 +126,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[InlineKeyboardButton("अगला नया सवाल ➡️", callback_data=mode)]]
             await context.bot.send_message(query.message.chat_id, "तैयार?", reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception as e:
-            logger.error(f"Poll Send Error: {e}")
+            logger.error(f"Poll Error: {e}")
             await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में समस्या आई।")
-    else:
-        await context.bot.send_message(query.message.chat_id, "❌ सवाल जनरेट नहीं हो सका।")
 
-# --- Main ---
 async def main():
     await start_web_server()
     app = Application.builder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("अपनी JSON फाइल भेजें!")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("JSON फाइल भेजें!")))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
     app.add_handler(CallbackQueryHandler(button_click))
 
