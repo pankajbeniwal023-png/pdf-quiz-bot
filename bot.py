@@ -26,7 +26,7 @@ USER_ASKED_IDS = {}
 POLL_TRACKER = {}
 
 async def fetch_data_from_google_drive():
-    """Robust parser to handle any JSON structure from AI Studio"""
+    """Robust parser to handle JSON structure and clean up escape characters"""
     global PROCESSED_DATA
     if not DRIVE_FILE_ID:
         logger.error("DRIVE_FILE_ID environment variable missing!")
@@ -38,7 +38,7 @@ async def fetch_data_from_google_drive():
             async with session.get(url) as resp:
                 if resp.status == 200:
                     text_data = await resp.text()
-                    # Clean potential markdown output from AI
+                    # Clean markdown and common text anomalies from raw text
                     clean_text = text_data.strip().replace("```json", "").replace("```", "")
                     raw_data = json.loads(clean_text)
                     
@@ -130,7 +130,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_loaded = len(PROCESSED_DATA["direct"])
             return await query.message.reply_text(f"✅ **Google Drive से {total_loaded} नए सवाल सिंक हो गए हैं!**")
         else:
-            return await query.message.reply_text("❌ Google Drive से फ़ाइल सिंक करने में समस्या आई। File ID जांचें।")
+            return await query.message.reply_text("❌ Google Drive से फ़ाइल सिंक करने में समस्या आई। Drive File ID व Permissions जांचें।")
 
     mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
     selected_mode = mode_map.get(query.data)
@@ -205,10 +205,14 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
         return
 
     q = quiz[idx]
+    
+    # Text sanitization to fix illegal formatting characters from AI JSON
+    clean_question = str(q['question']).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "")
+
     msg = await context.bot.send_poll(
         chat_id=chat_id,
-        question=f"Q{idx + 1}/{total}. {q['question']}"[:300],
-        options=[opt[:100] for opt in q['options']],
+        question=f"Q{idx + 1}/{total}. {clean_question}"[:300],
+        options=[str(opt)[:100] for opt in q['options']],
         type=Poll.QUIZ,
         correct_option_id=q['answer'],
         is_anonymous=False
@@ -260,7 +264,7 @@ async def main():
             update = Update.de_json(data, ptb_app.bot)
             await ptb_app.process_update(update)
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error handling update: {e}")
         return web.Response(text="OK")
 
     web_app.router.add_post(f"/{TOKEN}", telegram_webhook)
