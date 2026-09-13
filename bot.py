@@ -3,87 +3,62 @@ import json
 import logging
 import asyncio
 import random
-import re
-from aiohttp import web
+from aiohttp import web, ClientSession
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     PollAnswerHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    filters,
     ContextTypes
 )
-from google import genai
-from google.genai import types
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 RENDER_URL = os.environ.get("RENDER_URL")
-
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+DRIVE_FILE_ID = os.environ.get("DRIVE_FILE_ID")
 
 # Global Storage
 PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
 ASKED_IDS = set()
 POLL_TRACKER = {}
 
-def clean_json_response(text: str):
-    """Clean markdown backticks and extract raw JSON"""
-    text = text.strip()
-    match = re.search(r'\[.*\]', text, re.DOTALL)
-    if match:
-        return match.group(0)
-    return text
-
-async def generate_variations_from_text(input_text: str):
-    prompt = f"""
-Strictly extract study concepts from text and format into a JSON array of quiz questions in Hindi.
-
-For each concept, make 3 modes:
-1. "direct": Simple factual MCQ.
-2. "statement": Assertion-Reason style in Hindi.
-   - Question: "कथन (A): ... \nकारण (R): ..."
-   - Options MUST be:
-     0: कथन (A) और कारण (R) दोनों सही हैं और (R), (A) की सही व्याख्या है।
-     1: कथन (A) और कारण (R) दोनों सही हैं लेकिन (R), (A) की सही व्याख्या नहीं है।
-     2: कथन (A) सही है लेकिन कारण (R) गलत है।
-     3: कथन (A) गलत है लेकिन कारण (R) सही है।
-3. "twisted": Rephrase question analytically.
-
-Input Text:
-{input_text[:3000]}
-
-Respond ONLY with valid JSON array:
-[
-  {{
-    "direct": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}},
-    "statement": {{"question": "...", "options": ["कथन (A) और कारण (R)...", "..."], "answer": 0}},
-    "twisted": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}}
-  }}
-]
-"""
+async def fetch_data_from_google_drive():
+    """Fetch JSON data from Google Drive public link with zero API lag"""
+    global PROCESSED_DATA, ASKED_IDS
+    if not DRIVE_FILE_ID:
+        logger.error("DRIVE_FILE_ID Environment variable not set!")
+        return False
+        
+    url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
     try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.3,
-            ),
-        )
-        cleaned_json = clean_json_response(response.text)
-        return json.loads(cleaned_json)
+        async with ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    text_data = await resp.text()
+                    raw_json = json.loads(text_data.strip())
+                    
+                    PROCESSED_DATA["direct"] = [item["direct"] for item in raw_json if "direct" in item]
+                    PROCESSED_DATA["statement"] = [item["statement"] for item in raw_json if "statement" in item]
+                    PROCESSED_DATA["twisted"] = [item["twisted"] for item in raw_json if "twisted" in item]
+                    
+                    ASKED_IDS.clear()
+                    logger.info(f"Successfully loaded {len(raw_json)} questions from Google Drive.")
+                    return True
+                else:
+                    logger.error(f"Failed to fetch Google Drive file. Status code: {resp.status}")
+                    return False
     except Exception as e:
-        logger.error(f"AI Generation Warning: {e}")
-        return []
+        logger.error(f"Drive Sync Error: {e}")
+        return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Auto-load data if empty
+    if not PROCESSED_DATA["direct"]:
+        await fetch_data_from_google_drive()
+        
     keyboard = [
         [
             InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct"),
@@ -91,104 +66,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted"),
-            InlineKeyboardButton("🧹 रीसेट", callback_data="mode_reset")
+            InlineKeyboardButton("🔄 Drive Sync", callback_data="mode_sync")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     msg = (
-        "🧠 **100% Fail-Proof Quiz Bot**\n\n"
-        "1. अपनी फोटो (Image), `.txt` या कोई भी टेक्स्ट नोट्स भेजें।\n"
-        "2. AI तुरंत बैकग्राउंड में सभी मोड तैयार कर लेगा।\n"
-        "3. बटन दबाते ही **0.1 सेकंड (माइक्रो-सेकंड)** में सवाल आ जाएंगे!"
+        "🧠 **Google Drive Integrated Quiz Bot**\n\n"
+        "1. गूगल ड्राइव से सभी प्रश्नों के कथन-कारण और Twisted वर्ज़न सिंक हो चुके हैं।\n"
+        "2. नीचे दिए गए बटन पर क्लिक करें। **माइक्रो-सेकंड** में हर बार नया घुमावदार सवाल मिलेगा!"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
-
-# Document & Text Processing
-async def handle_document_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई! 100% ऑटो-प्रोसेसिंग जारी है... ⚡")
-    
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        content = await file.download_as_bytearray()
-        text_data = content.decode('utf-8', errors='ignore').strip()
-        
-        # Split text into safe chunks to prevent API failure
-        lines = [line for line in text_data.split("\n") if line.strip()]
-        chunk_size = 15
-        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
-        
-        all_results = []
-        for chunk in chunks:
-            chunk_text = "\n".join(chunk)
-            if chunk_text.strip():
-                res = await generate_variations_from_text(chunk_text)
-                if isinstance(res, list):
-                    all_results.extend(res)
-                await asyncio.sleep(0.5) # Avoid rate limits
-                
-        if all_results:
-            store_processed_results(all_results)
-            await finalize_upload_response(status_msg, len(all_results))
-        else:
-            await status_msg.edit_text("❌ कंटेंट बहुत छोटा था या समझ नहीं आया। थोड़ा और स्पष्ट टेक्स्ट भेजें।")
-            
-    except Exception as e:
-        logger.error(f"Document Error: {e}")
-        await status_msg.edit_text("❌ फ़ाइल रीड करने में समस्या आई।")
-
-# Handle Image Input
-async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("📸 फोटो मिल गई! AI प्रश्न और कथन-कारण बना रहा है... ⚡")
-    try:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        
-        prompt = "Extract study text/facts from this image and list them clearly as plain text."
-        
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(data=bytes(photo_bytes), mime_type="image/jpeg"),
-                prompt
-            ]
-        )
-        extracted_text = response.text.strip()
-        
-        results = await generate_variations_from_text(extracted_text)
-        if results:
-            store_processed_results(results)
-            await finalize_upload_response(status_msg, len(results))
-        else:
-            await status_msg.edit_text("❌ फोटो से प्रश्न नहीं बन पाए। कृपया साफ फोटो भेजें।")
-            
-    except Exception as e:
-        logger.error(f"Photo Error: {e}")
-        await status_msg.edit_text("❌ फोटो प्रोसेस करने में त्रुटि आई।")
-
-def store_processed_results(results_list):
-    global PROCESSED_DATA, ASKED_IDS
-    PROCESSED_DATA["direct"] = [item["direct"] for item in results_list if "direct" in item]
-    PROCESSED_DATA["statement"] = [item["statement"] for item in results_list if "statement" in item]
-    PROCESSED_DATA["twisted"] = [item["twisted"] for item in results_list if "twisted" in item]
-    ASKED_IDS.clear()
-
-async def finalize_upload_response(status_msg, count):
-    keyboard = [
-        [InlineKeyboardButton("📝 कथन-कारण टेस्ट (Statement)", callback_data="mode_statement")],
-        [InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")],
-        [InlineKeyboardButton("🎯 डायरेक्ट क्विज़", callback_data="mode_direct")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await status_msg.edit_text(
-        f"✅ **{count} प्रश्न सफलता पूर्वक तैयार हो गए!**\n\n"
-        "⚡ अब बटन पर क्लिक करें, बिना किसी लैग के नया सवाल आएगा:", 
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -198,6 +86,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global ASKED_IDS
         ASKED_IDS.clear()
         return await query.message.reply_text("🧹 **पूछे गए सवालों की हिस्ट्री रीसेट हो गई है!**")
+
+    if query.data == "mode_sync":
+        success = await fetch_data_from_google_drive()
+        if success:
+            return await query.message.reply_text(f"✅ **Google Drive से {len(PROCESSED_DATA['direct'])} नए सवाल सिंक हो गए हैं!**")
+        else:
+            return await query.message.reply_text("❌ Google Drive से फ़ाइल सिंक करने में समस्या आई। File ID जांचें।")
 
     mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
     selected_mode = mode_map.get(query.data)
@@ -209,7 +104,10 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
-        return await context.bot.send_message(chat_id, "❌ पहले नोट्स, फोटो या फ़ाइल अपलोड करें!")
+        await fetch_data_from_google_drive()
+        bank = PROCESSED_DATA.get(mode, [])
+        if not bank:
+            return await context.bot.send_message(chat_id, "❌ Google Drive में सवाल नहीं मिले! पहले फ़ाइल अपलोड करें।")
 
     unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
 
@@ -294,18 +192,26 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await send_next_quiz(context, chat_id, user_id)
 
+async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    success = await fetch_data_from_google_drive()
+    if success:
+        await update.message.reply_text(f"✅ **Google Drive से {len(PROCESSED_DATA['direct'])} नए सवाल सिंक हो गए!**")
+    else:
+        await update.message.reply_text("❌ सिंक करने में एरर आई।")
+
 async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("sync", sync_cmd))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
-    ptb_app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
-    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document_input))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_document_input))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await ptb_app.initialize()
     await ptb_app.start()
+
+    # Initial Sync on Boot
+    await fetch_data_from_google_drive()
 
     webhook_url = f"{RENDER_URL}/{TOKEN}"
     await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
