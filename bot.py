@@ -1,11 +1,14 @@
 import os
 import re
+import io
 import json
 import logging
 import asyncio
 import random
+import tempfile
 import traceback
 from aiohttp import web, ClientSession
+import pypdf
 import google.generativeai as genai
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,7 +29,6 @@ RENDER_URL = os.environ.get("RENDER_URL")
 RAW_DRIVE_ID = os.environ.get("DRIVE_FILE_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Drive ID को सुरक्षित रूप से निकालना (अगर यूजर ने पूरा लिंक भी डाल दिया हो तो)
 def clean_drive_id(raw_val):
     if not raw_val:
         return ""
@@ -41,17 +43,29 @@ def clean_drive_id(raw_val):
 
 DRIVE_FILE_ID = clean_drive_id(RAW_DRIVE_ID)
 
-# Gemini AI सेटअप
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ग्लोबल डेटा स्टोर
-USER_STUDY_MATERIAL = {}  # {user_id: {"type": "bytes", "data": bytes, "mime_type": str}}
+USER_STUDY_MATERIAL = {}
 USER_SESSIONS = {}
 POLL_TRACKER = {}
 
+def extract_text_from_pdf(pdf_bytes):
+    """pypdf के जरिए PDF से पूरा टेक्स्ट सुरक्षित निकालना"""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        extracted = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                extracted.append(t)
+        return "\n".join(extracted).strip()
+    except Exception as e:
+        logger.warning(f"pypdf extraction failed: {e}")
+        return ""
+
 def parse_correct_answer(raw_answer, options):
-    """'A','B','C','D', 1-based (1,2,3,4) या स्ट्रिंग को Telegram के 0-indexed int में सुरक्षित बदलता है"""
+    """0-indexed सही विकल्प इंडेक्स निकालना"""
     if raw_answer is None:
         return 0
     if isinstance(raw_answer, int):
@@ -78,13 +92,12 @@ def parse_correct_answer(raw_answer, options):
     return 0
 
 def get_best_available_model():
-    """AI Studio में उपलब्ध एक्टिव मॉडल को चुनता है ताकि 404 एरर न आए"""
+    """उपलब्ध मॉडल चुनना"""
     preferred_models = [
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
         "gemini-2.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash"
+        "gemini-1.5-flash-latest"
     ]
     try:
         online_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
@@ -95,7 +108,7 @@ def get_best_available_model():
         if online_models:
             return online_models[0]
     except Exception as e:
-        logger.warning(f"Could not list models: {e}")
+        logger.warning(f"Model list fallback: {e}")
     
     return "models/gemini-3.8-flash"
 
@@ -115,28 +128,37 @@ def get_main_keyboard():
     ])
 
 async def sync_drive_file(user_id: int):
-    """Google Drive से PDF डाउनलोड करके AI में लोड करना"""
+    """Google Drive से असली PDF डाउनलोड करना"""
     if not DRIVE_FILE_ID:
-        return False, "DRIVE_FILE_ID सेट नहीं है। कृपया Render Environment में ID डालें।"
-    url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
-    try:
-        async with ClientSession() as session:
-            async with session.get(url, timeout=30, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    USER_STUDY_MATERIAL[user_id] = {
-                        "type": "bytes",
-                        "data": data,
-                        "mime_type": "application/pdf"
-                    }
-                    return True, "Google Drive से आपकी PDF सफलतापूर्वक सिंक हो गई!"
-                else:
-                    return False, f"Drive एरर कोड: {resp.status}। Drive फ़ाइल की लिंक 'Anyone with link can view' होनी चाहिए।"
-    except Exception as e:
-        return False, f"Drive डाउनलोड एरर: {str(e)}"
+        return False, "DRIVE_FILE_ID सेट नहीं है।"
+
+    urls = [
+        f"https://drive.usercontent.google.com/download?id={DRIVE_FILE_ID}&export=download&confirm=t",
+        f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}&confirm=t"
+    ]
+
+    for url in urls:
+        try:
+            async with ClientSession() as session:
+                async with session.get(url, timeout=30, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        if data.startswith(b"<!DOCTYPE") or data.startswith(b"<html"):
+                            continue
+                        
+                        USER_STUDY_MATERIAL[user_id] = {
+                            "type": "bytes",
+                            "data": data,
+                            "mime_type": "application/pdf"
+                        }
+                        return True, "Google Drive से PDF लोड हो गई!"
+        except Exception as e:
+            logger.warning(f"Drive download failed on {url}: {e}")
+            continue
+
+    return False, "Drive से असली PDF नहीं मिली। कृपया Drive फ़ाइल को 'Anyone with link' (पब्लिक) करें, या सीधे इस चैट में अपनी PDF भेज दें!"
 
 async def generate_questions_with_ai(user_id: int, mode: str, count: int = 5):
-    """Gemini AI से सीधे रंगीन नोट्स/PDF से नए सवाल जनरेट करवाता है"""
     material = USER_STUDY_MATERIAL.get(user_id)
     if not material:
         return None, "⚠️ कोई नोट्स/PDF लोड नहीं है!"
@@ -149,18 +171,17 @@ async def generate_questions_with_ai(user_id: int, mode: str, count: int = 5):
     }
 
     prompt = f"""
-    आप एक उच्च स्तरीय शिक्षक हैं। नीचे दिए गए स्टडी मटीरियल (नोट्स/किताब) को ध्यानपूर्वक पढ़ें।
-    इस मटीरियल से {count} बिल्कुल नए और अलग प्रश्न तैयार करें।
+    आप एक उच्च स्तरीय शिक्षक हैं। नीचे दिए गए स्टडी मटीरियल को ध्यानपूर्वक पढ़ें।
+    इस मटीरियल से {count} बिल्कुल नए प्रश्न तैयार करें।
     प्रश्नों का प्रकार: {mode_prompts.get(mode, mode_prompts['mix'])}
 
     नियम:
     1. सवाल और विकल्प हिंदी में होने चाहिए।
     2. हर सवाल के 4 स्पष्ट विकल्प हों।
-    3. सवाल 280 अक्षरों से छोटा होना चाहिए और हर विकल्प 90 अक्षरों से छोटा।
-    4. उत्तर को 0-indexed संख्या के रूप में दें (0 = पहला विकल्प, 1 = दूसरा विकल्प, 2 = तीसरा, 3 = चौथा)।
-    5. केवल शुद्ध JSON फॉर्मेट में उत्तर दें, कोई अन्य फालतू टेक्स्ट न लिखें।
+    3. सवाल 280 अक्षरों से छोटा और प्रत्येक विकल्प 90 अक्षरों से छोटा होना चाहिए।
+    4. उत्तर को 0-indexed संख्या दें (0 = पहला, 1 = दूसरा, 2 = तीसरा, 3 = चौथा)।
+    5. सिर्फ JSON एरे लौटाएं:
 
-    JSON फॉर्मेट:
     [
       {{
         "question": "सवाल यहाँ...",
@@ -170,21 +191,44 @@ async def generate_questions_with_ai(user_id: int, mode: str, count: int = 5):
     ]
     """
 
-    content_parts = [
-        prompt,
-        {
-            "mime_type": material["mime_type"],
-            "data": material["data"]
-        }
-    ]
+    content_parts = []
+    temp_uploaded_file = None
+    temp_local_path = None
 
-    model_name = get_best_available_model()
     try:
+        if material["mime_type"] == "application/pdf":
+            # 1. पहले pypdf से टेक्स्ट निकालने की कोशिश (सुपर फास्ट और 400 एरर प्रूफ)
+            extracted_text = extract_text_from_pdf(material["data"])
+            if len(extracted_text) > 80:
+                content_parts = [prompt, f"\n\n--- संदर्भ सामग्री ---\n{extracted_text[:40000]}"]
+            else:
+                # 2. अगर स्कैन्ड इमेज PDF है तो Google File API के जरिए अपलोड
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(material["data"])
+                    temp_local_path = tmp.name
+                
+                temp_uploaded_file = genai.upload_file(path=temp_local_path, mime_type="application/pdf")
+                content_parts = [temp_uploaded_file, prompt]
+
+        elif material["mime_type"].startswith("image/"):
+            content_parts = [
+                prompt,
+                {
+                    "mime_type": material["mime_type"],
+                    "data": material["data"]
+                }
+            ]
+        else:
+            content_parts = [prompt, str(material["data"])]
+
+        model_name = get_best_available_model()
         model = genai.GenerativeModel(model_name)
+        
         response = model.generate_content(
             content_parts,
             generation_config={"response_mime_type": "application/json"}
         )
+
         raw_text = response.text.strip()
         if "```json" in raw_text:
             raw_text = raw_text.split("```json")[1].split("```")[0].strip()
@@ -194,10 +238,22 @@ async def generate_questions_with_ai(user_id: int, mode: str, count: int = 5):
         questions = json.loads(raw_text)
         if isinstance(questions, list) and len(questions) > 0:
             return questions, None
-        return None, "AI ने सही फॉर्मेट में सवाल नहीं लौटाए।"
+        return None, "AI से सवालों की सूची खाली आई।"
+
     except Exception as e:
-        logger.error(f"AI Generation Error with {model_name}: {e}")
+        logger.error(f"AI Generation Error: {e}\n{traceback.format_exc()}")
         return None, str(e)
+    finally:
+        if temp_uploaded_file:
+            try:
+                genai.delete_file(temp_uploaded_file.name)
+            except Exception:
+                pass
+        if temp_local_path and os.path.exists(temp_local_path):
+            try:
+                os.remove(temp_local_path)
+            except Exception:
+                pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -205,17 +261,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = (
         "🧠 **AI Quiz Revision Bot Ready!**\n\n"
-        "💡 **अब सवाल कभी रिपीट नहीं होंगे:**\n"
-        "• आप अपनी **रंगीन PDF या नोट्स की फ़ोटो** सीधे यहाँ चैट में भेज सकते हैं।\n"
-        "• या नीचे दिए गए किसी भी बटन पर क्लिक करके सीधे खेलना शुरू करें (Drive से अपने आप लोड हो जाएगा)।\n\n"
-        "नीचे दिए गए बटन से अपना मोड चुनें:"
+        "💡 **अब हर बार बिल्कुल नए सवाल मिलेंगे:**\n"
+        "• आप अपनी **रंगीन PDF या नोट्स की फ़ोटो** सीधे इस चैट में भेज सकते हैं।\n"
+        "• या नीचे दिए गए किसी भी बटन पर क्लिक करें।\n\n"
+        "मोड चुनें और शुरू करें:"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 async def handle_document_or_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """जब आप सीधे चैट में रंगीन PDF या नोट्स की फ़ोटो भेजेंगे"""
+    """सीधे चैट में भेजी गई PDF या फोटो को सेव करना"""
     user_id = update.effective_user.id
-    status_msg = await update.message.reply_text("📥 **मटीरियल लोड हो रहा है, कृपया 5 सेकंड प्रतीक्षा करें...**")
+    status_msg = await update.message.reply_text("📥 **मटीरियल लोड हो रहा है, कृपया 3 सेकंड प्रतीक्षा करें...**")
 
     try:
         if update.message.document:
@@ -224,7 +280,7 @@ async def handle_document_or_photo(update: Update, context: ContextTypes.DEFAULT
             data = await file.download_as_bytearray()
             mime = doc.mime_type or "application/pdf"
             USER_STUDY_MATERIAL[user_id] = {"type": "bytes", "data": bytes(data), "mime_type": mime}
-            await status_msg.edit_text("✅ **आपकी रंगीन PDF लोड हो गई!**\nअब नीचे से मोड चुनें, AI तुरंत नए सवाल बनाएगा:", reply_markup=get_main_keyboard())
+            await status_msg.edit_text("✅ **आपकी PDF सफलतापूर्वक लोड हो गई!**\nअब नीचे से मोड चुनें, AI तुरंत नए सवाल बनाएगा:", reply_markup=get_main_keyboard())
         
         elif update.message.photo:
             photo = update.message.photo[-1]
@@ -234,7 +290,7 @@ async def handle_document_or_photo(update: Update, context: ContextTypes.DEFAULT
             await status_msg.edit_text("✅ **नोट्स की फ़ोटो लोड हो गई!**\nअब मोड चुनें और क्विज़ खेलें:", reply_markup=get_main_keyboard())
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ फ़ाइल लोड करने में समस्या: {e}")
+        await status_msg.edit_text(f"❌ लोड करने में समस्या: {e}")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -242,7 +298,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "sync_drive_pdf":
-        msg = await query.message.reply_text("🔄 **Google Drive से PDF डाउनलोड हो रही है...**")
+        msg = await query.message.reply_text("🔄 **Drive से PDF लोड हो रही है...**")
         success, err = await sync_drive_file(user_id)
         if success:
             return await msg.edit_text("✅ **Drive PDF लोड हो गई!** अब मोड चुनें:", reply_markup=get_main_keyboard())
@@ -261,20 +317,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_ai_quiz(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
     if not GEMINI_API_KEY:
-        return await context.bot.send_message(chat_id, "❌ `GEMINI_API_KEY` सेट नहीं है! कृपया Render में Key डालें।")
+        return await context.bot.send_message(chat_id, "❌ `GEMINI_API_KEY` सेट नहीं है! कृपया Render में Key जोड़ें।")
 
-    # अगर यूज़र के पास मटीरियल नहीं है, तो अपने आप Drive से फेच करने की कोशिश करें
     if user_id not in USER_STUDY_MATERIAL:
         if DRIVE_FILE_ID:
             temp_sync = await context.bot.send_message(chat_id, "📥 **Drive से PDF लोड हो रही है...**")
             success, err = await sync_drive_file(user_id)
             await temp_sync.delete()
             if not success:
-                return await context.bot.send_message(chat_id, f"❌ Drive से PDF लोड नहीं हो पाई:\n`{err}`\n\nआप अपनी PDF सीधे इस चैट में भी भेज सकते हैं!")
+                return await context.bot.send_message(chat_id, f"❌ Drive से PDF लोड नहीं हो पाई:\n`{err}`\n\n💡 **सलाह:** आप अपनी रंगीन PDF सीधे इस चैट में भी भेज सकते हैं!")
         else:
-            return await context.bot.send_message(chat_id, "⚠️ कोई नोट्स नहीं मिले! कृपया अपनी रंगीन PDF/नोट्स इस चैट में भेजें।")
+            return await context.bot.send_message(chat_id, "⚠️ कोई नोट्स नहीं मिले! कृपया अपनी रंगीन PDF या फोटो इस चैट में भेजें।")
 
-    load_msg = await context.bot.send_message(chat_id, "🤖 **AI आपके नोट्स से 5 बिल्कुल नए सवाल तैयार कर रहा है... (5-10 सेकंड)**")
+    load_msg = await context.bot.send_message(chat_id, "🤖 **AI आपके नोट्स पढ़कर 5 बिल्कुल नए सवाल तैयार कर रहा है... (5-10 सेकंड)**")
 
     questions, err = await generate_questions_with_ai(user_id, mode, count=5)
     if err or not questions:
@@ -304,7 +359,7 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = f"🎉 **सत्र समाप्त!**\n\n✅ सही उत्तर: {score}/{total}\n📊 आपका स्कोर: {per}%\n\nअगले 5 बिल्कुल नए सवाल खेलने के लिए कोई भी मोड चुनें:"
+        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score}/{total}\n📊 आपका स्कोर: {per}%\n\nअगले 5 बिल्कुल नए सवाल खेलने के लिए नीचे से मोड चुनें:"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=get_main_keyboard())
         user_data["busy"] = False
         return
