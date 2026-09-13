@@ -35,7 +35,7 @@ PROCESSED_DATA = {
 ASKED_IDS = set()
 POLL_TRACKER = {}
 
-# Prompt for Bulk Conversion to Assertion-Reason & Twisted Format
+# Bulk Generator Prompt
 async def process_all_questions_in_bulk(raw_questions: list):
     prompt = f"""
 You are an expert competitive exam question creator. 
@@ -104,9 +104,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = (
         "🧠 **Ultra-Fast Concept Building Quiz Bot**\n\n"
-        "1. अपनी `.json` या `.txt` प्रश्नों वाली फ़ाइल भेजें।\n"
-        "2. फ़ाइल अपलोड होते ही AI सभी प्रश्नों के **कथन-कारण (Assertion-Reason)** और **Twisted (लॉजिकल)** रूप तैयार कर लेगा।\n"
-        "3. नीचे दिए गए बटनों पर क्लिक करके **एक झटके में (Instant Microseconds में)** क्विज़ मोड बदलें!"
+        "1. अपनी `.json` या `.txt` फ़ाइल भेजें।\n"
+        "2. फ़ाइल अपलोड होते ही AI सभी प्रश्नों के वेरिएशन्स तैयार कर लेगा।\n"
+        "3. बटन पर क्लिक करके **माइक्रो-सेकंड** में क्विज़ मोड बदलें!"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
 
@@ -136,19 +136,20 @@ async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TY
             ASKED_IDS.clear()
             
             keyboard = [
-                [InlineKeyboardButton("📝 कथन-कारण टेस्ट शुरू करें", callback_data="mode_statement")],
-                [InlineKeyboardButton("🔄 घुमावदार (Twisted) टेस्ट शुरू करें", callback_data="mode_twisted")]
+                [InlineKeyboardButton("📝 कथन-कारण टेस्ट (Statement)", callback_data="mode_statement")],
+                [InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")],
+                [InlineKeyboardButton("🎯 डायरेक्ट क्विज़ (Direct)", callback_data="mode_direct")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await status_msg.edit_text(
-                f"✅ **{len(data)} प्रश्न सफलतापूर्वक प्रोसेस हो गए!**\n\n"
-                "⚡ सभी प्रकार के वेरिएशन्स तैयार हैं। कौन सा मोड खेलना चाहते हैं?", 
+                f"✅ **{len(data)} प्रश्न सफलतापूर्वक लोड हो गए!**\n\n"
+                "⚡ नीचे दिए गए बटन पर क्लिक करके टेस्ट शुरू करें:", 
                 parse_mode="Markdown",
                 reply_markup=reply_markup
             )
         else:
-            await status_msg.edit_text("❌ फ़ाइल में सही JSON लिस्ट प्रारूप नहीं है।")
+            await status_msg.edit_text("❌ फ़ाइल में सही JSON प्रारूप नहीं है।")
     except Exception as e:
         logger.error(f"File handling error: {e}")
         await status_msg.edit_text("❌ फ़ाइल प्रोसेस करने में त्रुटि हुई। फ़ाइल फ़ॉर्मैट जांचें।")
@@ -156,33 +157,53 @@ async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TY
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
+    if query.data == "mode_reset":
+        global ASKED_IDS
+        ASKED_IDS.clear()
+        return await query.message.reply_text("🧹 **सभी पूछे गए प्रश्नों की हिस्ट्री रीसेट कर दी गई है!**")
+
     mode_map = {
         "mode_direct": "direct",
         "mode_statement": "statement",
         "mode_twisted": "twisted"
     }
 
-    if query.data in mode_map:
-        await start_quiz_session_from_query(query, context, mode=mode_map[query.data])
-    elif query.data == "mode_reset":
-        global ASKED_IDS
-        ASKED_IDS.clear()
-        await query.edit_message_text("🧹 **सभी पूछे गए प्रश्नों की हिस्ट्री रीसेट कर दी गई है!**")
+    selected_mode = mode_map.get(query.data)
+    if selected_mode:
+        await start_quiz_session(
+            chat_id=query.message.chat_id,
+            user_id=query.from_user.id,
+            context=context,
+            mode=selected_mode
+        )
 
-async def start_quiz_session_from_query(query, context: ContextTypes.DEFAULT_TYPE, mode: str):
+async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update.effective_chat.id, update.effective_user.id, context, mode="direct")
+
+async def statement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update.effective_chat.id, update.effective_user.id, context, mode="statement")
+
+async def twisted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz_session(update.effective_chat.id, update.effective_user.id, context, mode="twisted")
+
+async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
     global PROCESSED_DATA, ASKED_IDS
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
-        return await query.message.reply_text("❌ कृपया पहले प्रश्नों वाली `.json` या `.txt` फ़ाइल अपलोड करें!")
+        return await context.bot.send_message(chat_id, "❌ कृपया पहले प्रश्नों वाली फ़ाइल अपलोड करें!")
 
     unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
 
     if not unasked_indices:
-        return await query.message.reply_text(
-            "🎉 **सभी प्रश्न समाप्त हो चुके हैं!**\n"
-            "पुनः शुरू करने के लिए रीसेट बटन दबाएं या `/reset` टाइप करें।"
+        keyboard = [[InlineKeyboardButton("🧹 हिस्ट्री रीसेट करें", callback_data="mode_reset")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        return await context.bot.send_message(
+            chat_id,
+            "🎉 **सभी प्रश्न समाप्त हो चुके हैं!**\nपुनः शुरू करने के लिए रीसेट बटन दबाएं।",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
 
     count = 5
@@ -193,9 +214,7 @@ async def start_quiz_session_from_query(query, context: ContextTypes.DEFAULT_TYP
         ASKED_IDS.add(idx)
         session_questions.append(bank[idx])
 
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-
+    # Save state under application user_data properly
     context.application.user_data[user_id] = {
         "quiz": session_questions,
         "idx": 0,
@@ -221,13 +240,16 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
         remaining = len(PROCESSED_DATA["direct"]) - len(ASKED_IDS)
         
         keyboard = [
-            [InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")],
-            [InlineKeyboardButton("📝 Statement Mode", callback_data="mode_statement")]
+            [
+                InlineKeyboardButton("📝 Statement Mode", callback_data="mode_statement"),
+                InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")
+            ],
+            [InlineKeyboardButton("🧹 रीसेट", callback_data="mode_reset")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         res = (
-            f"🎉 **क्विज़ समाप्त!**\n\n"
+            f"🎉 **क्विज़ पूरा हुआ!**\n\n"
             f"✅ सही उत्तर: {score} / {total}\n"
             f"📊 स्कोर: {per}%\n"
             f"📚 शेष नए सवाल: {remaining}"
@@ -289,6 +311,9 @@ async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("quiz", quiz_cmd))
+    ptb_app.add_handler(CommandHandler("statement", statement_cmd))
+    ptb_app.add_handler(CommandHandler("twisted", twisted_cmd))
     ptb_app.add_handler(CommandHandler("reset", reset_cmd))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
