@@ -21,23 +21,32 @@ RENDER_URL = os.environ.get("RENDER_URL")
 DRIVE_FILE_ID = os.environ.get("DRIVE_FILE_ID")
 
 PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
+LAST_ERROR = "No error logged yet."
 USER_ASKED_IDS = {}
 POLL_TRACKER = {}
 
 async def fetch_data_from_google_drive():
-    global PROCESSED_DATA
+    global PROCESSED_DATA, LAST_ERROR
     if not DRIVE_FILE_ID:
-        return False
+        LAST_ERROR = "DRIVE_FILE_ID environment variable missing."
+        logger.error(LAST_ERROR)
+        return False, LAST_ERROR
         
     url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
     try:
         async with ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
+            async with session.get(url, timeout=12) as resp:
                 if resp.status == 200:
                     text_data = await resp.text()
                     clean_text = text_data.strip().replace("```json", "").replace("```", "")
-                    raw_data = json.loads(clean_text)
                     
+                    try:
+                        raw_data = json.loads(clean_text)
+                    except Exception as json_err:
+                        LAST_ERROR = f"JSON Parsing Error: {json_err}"
+                        logger.error(LAST_ERROR)
+                        return False, LAST_ERROR
+
                     direct_list, statement_list, twisted_list = [], [], []
 
                     if isinstance(raw_data, list):
@@ -50,11 +59,23 @@ async def fetch_data_from_google_drive():
                     PROCESSED_DATA["direct"] = direct_list
                     PROCESSED_DATA["statement"] = statement_list
                     PROCESSED_DATA["twisted"] = twisted_list
-                    return True
-                return False
+                    
+                    total_count = len(direct_list) + len(statement_list) + len(twisted_list)
+                    if total_count == 0:
+                        LAST_ERROR = "Drive file fetched successfully, but 0 questions parsed from JSON keys."
+                        return False, LAST_ERROR
+                    
+                    LAST_ERROR = f"Success! Loaded {len(direct_list)} direct, {len(statement_list)} statement, {len(twisted_list)} twisted."
+                    logger.info(LAST_ERROR)
+                    return True, LAST_ERROR
+                else:
+                    LAST_ERROR = f"Drive HTTP Error Code: {resp.status}. Check link sharing permissions."
+                    logger.error(LAST_ERROR)
+                    return False, LAST_ERROR
     except Exception as e:
-        logger.error(f"Drive Exception: {e}")
-        return False
+        LAST_ERROR = f"Drive Fetch Exception: {str(e)}"
+        logger.error(LAST_ERROR)
+        return False, LAST_ERROR
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -77,6 +98,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "🧠 **Quiz Bot Ready!**\n\nनीचे दिए गए बटन पर क्लिक करके खेलना शुरू करें:"
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def debug_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_msg = (
+        f"🛠 **Debug Report:**\n\n"
+        f"• **DRIVE_FILE_ID:** `{DRIVE_FILE_ID}`\n"
+        f"• **Direct Questions:** {len(PROCESSED_DATA['direct'])}\n"
+        f"• **Statement Questions:** {len(PROCESSED_DATA['statement'])}\n"
+        f"• **Twisted Questions:** {len(PROCESSED_DATA['twisted'])}\n\n"
+        f"• **Last Log:** `{LAST_ERROR}`"
+    )
+    await update.message.reply_text(status_msg, parse_mode="Markdown")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -98,12 +130,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await query.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!** नया मोड चुनें:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     if query.data == "mode_sync":
-        success = await fetch_data_from_google_drive()
+        success, err_msg = await fetch_data_from_google_drive()
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
         if success:
-            return await query.message.reply_text("✅ **Google Drive से नया डेटा सिंक हो गया!**")
+            return await query.message.reply_text(f"✅ **Google Drive से नया डेटा सिंक हो गया!**\n\n`{err_msg}`", parse_mode="Markdown")
         else:
-            return await query.message.reply_text("❌ Drive Sync फेल हो गया। Permissions चेक करें।")
+            return await query.message.reply_text(f"❌ **Drive Sync एरर:**\n\n`{err_msg}`", parse_mode="Markdown")
 
     mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
     selected_mode = mode_map.get(query.data)
@@ -114,10 +146,14 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
-        await fetch_data_from_google_drive()
+        success, err_msg = await fetch_data_from_google_drive()
         bank = PROCESSED_DATA.get(mode, [])
         if not bank:
-            return await context.bot.send_message(chat_id, "❌ Drive में इस मोड के सवाल नहीं मिले!")
+            return await context.bot.send_message(
+                chat_id, 
+                f"❌ **डेटा लोडिंग एरर:**\n\n`{err_msg}`\n\nकृपया Google Drive फाईल लिंक/Permission चेक करें या `/debug` कमांड भेजें।",
+                parse_mode="Markdown"
+            )
 
     if user_id not in USER_ASKED_IDS:
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
@@ -179,7 +215,6 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     q = quiz[idx]
     clean_question = str(q['question']).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "")
 
-    # Clean and slice text to strictly adhere to Telegram Poll limits
     poll_question = f"Q{idx + 1}/{total}. {clean_question}"[:295]
     poll_options = [str(opt)[:95] for opt in q['options']]
 
@@ -218,6 +253,7 @@ async def main():
 
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("reset", start))
+    ptb_app.add_handler(CommandHandler("debug", debug_status))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
