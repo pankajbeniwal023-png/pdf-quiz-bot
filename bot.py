@@ -1,196 +1,332 @@
 import os
 import json
-import random
-import asyncio
 import logging
-import re
+import asyncio
+import random
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    PollAnswerHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
 from google import genai
 from google.genai import types
 
-# --- Logging ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Config ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+RENDER_URL = os.environ.get("RENDER_URL")
 
-# AI Client Setup
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-MODEL_NAME = "gemini-2.5-flash"  # Active & Stable Fast Model
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-USER_DATA = {}
+# Global Storage
+PROCESSED_DATA = {
+    "direct": [],
+    "statement": [],
+    "twisted": []
+}
+ASKED_IDS = set()
+POLL_TRACKER = {}
 
-# --- Render Port Binding ---
-async def handle_root(request):
-    return web.Response(text="Guaranteed Quiz Bot Active")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-# --- AI Question Rewriter (Zero Fail Logic) ---
-async def get_ai_rewritten_question(orig_q, correct_val, mode):
-    if not ai_client:
-        return None
-
-    prompts = {
-        "mode_twisted": f"इस प्रश्न की भाषा को उच्च स्तरीय परीक्षा शैली (RPSC/RSMSSB) में बदलो। अर्थ वही रहे: '{orig_q}'",
-        "mode_reverse": f"उत्तर '{correct_val}' है। इस उत्तर के आधार पर एक कठिन पहेलीनुमा प्रश्न बनाओ जो मूल प्रश्न '{orig_q}' पर आधारित हो।",
-        "mode_statement": f"कथन (Assertion) बनाओ मूल प्रश्न: '{orig_q}' से, और उसका सटीक कारण (Reason) लिखो जो सही उत्तर '{correct_val}' को सिद्ध करता हो।"
-    }
-
+# Prompt for Bulk Conversion to Assertion-Reason & Twisted Format
+async def process_all_questions_in_bulk(raw_questions: list):
     prompt = f"""
-तुम राजस्थान प्रतियोगी परीक्षा विशेषज्ञ हो।
-कार्यान्वयन: {prompts[mode]}
-नियम: केवल एक नया सवाल या कथन-कारण लिखकर शुद्ध JSON आउटपुट दो।
-JSON प्रारूप: {{"new_question": "यहाँ नया प्रश्न या कथन लिखें"}}
-"""
+You are an expert competitive exam question creator. 
+Convert each provided raw question/fact into 3 distinct variation formats:
 
+1. "direct": Standard fact-based question.
+2. "statement": Strict Assertion-Reason style in Hindi.
+   - Format Question: "कथन (A): ... \nकारण (R): ..."
+   - Standard Options MUST be:
+     0: कथन (A) और कारण (R) दोनों सही हैं और (R), (A) की सही व्याख्या है।
+     1: कथन (A) और कारण (R) दोनों सही हैं लेकिन (R), (A) की सही व्याख्या नहीं है।
+     2: कथन (A) सही है लेकिन कारण (R) गलत है।
+     3: कथन (A) गलत है लेकिन कारण (R) सही है।
+3. "twisted": Rephrase the question analytically so the candidate has to think conceptually rather than relying on rote memory.
+
+Input Questions JSON:
+{json.dumps(raw_questions, ensure_ascii=False)}
+
+Rules:
+- Output STRICT VALID JSON array with this schema:
+[
+  {{
+    "id": 0,
+    "direct": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}},
+    "statement": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}},
+    "twisted": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}}
+  }}
+]
+"""
     try:
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
-            model=MODEL_NAME,
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.8,
-            )
+                temperature=0.6,
+            ),
         )
-        res_text = response.text.strip()
-        if "```json" in res_text:
-            match = re.search(r'```json\s*(.*?)\s*```', res_text, re.DOTALL)
-            if match:
-                res_text = match.group(1)
-        data = json.loads(res_text)
-        return data.get("new_question")
+        parsed = json.loads(response.text.strip())
+        return parsed
     except Exception as e:
-        logger.error(f"AI API Fail (Fallback activated): {e}")
-        return None
+        logger.error(f"Bulk Generation Error: {e}")
+        fallback = []
+        for i, q in enumerate(raw_questions):
+            fallback.append({
+                "id": i,
+                "direct": q,
+                "statement": q,
+                "twisted": q
+            })
+        return fallback
 
-# --- Smart Question Builder ---
-async def build_question(user_id, mode):
-    item = random.choice(USER_DATA[user_id])
-    orig_q = item.get('question', '').strip()
-    options = list(item.get('options', []))
-    correct_idx = item.get('answer', 0)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("🎯 डायरेक्ट क्विज़", callback_data="mode_direct"),
+            InlineKeyboardButton("📝 कथन-कारण (Statement)", callback_data="mode_statement")
+        ],
+        [
+            InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted"),
+            InlineKeyboardButton("🧹 रीसेट डेटा", callback_data="mode_reset")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    msg = (
+        "🧠 **Ultra-Fast Concept Building Quiz Bot**\n\n"
+        "1. अपनी `.json` या `.txt` प्रश्नों वाली फ़ाइल भेजें।\n"
+        "2. फ़ाइल अपलोड होते ही AI सभी प्रश्नों के **कथन-कारण (Assertion-Reason)** और **Twisted (लॉजिकल)** रूप तैयार कर लेगा।\n"
+        "3. नीचे दिए गए बटनों पर क्लिक करके **एक झटके में (Instant Microseconds में)** क्विज़ मोड बदलें!"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
 
-    if not orig_q or not options:
-        return None
-
-    correct_val = options[correct_idx] if correct_idx < len(options) else options[0]
-
-    # Step 1: AI से केवल प्रश्न की भाषा बदलवाएं
-    ai_q = await get_ai_rewritten_question(orig_q, correct_val, mode)
-
-    # Step 2: अगर AI सफल रहा तो वो सवाल लें, नहीं तो बैकअप पैटर्न (Guarantee Logic)
-    if ai_q:
-        final_q = ai_q
-    else:
-        # Fallback Options (अगर AI का सर्वर डाउन भी हो तो ये चलेगा)
-        if mode == "mode_twisted":
-            final_q = f"परीक्षा दृष्टिकोण से विचार कीजिए: {orig_q}"
-        elif mode == "mode_reverse":
-            final_q = f"यदि उत्तर '{correct_val}' है, तो यह किस संदर्भ से संबंधित है?"
-        else:
-            final_q = f"कथन: {orig_q}\n(तर्क सही उत्तर '{correct_val}' पर आधारित है)"
-
-    # Step 3: विकल्पों का क्रम randomly बदलें (Shuffling)
-    shuffled_options = options.copy()
-    random.shuffle(shuffled_options)
-    new_correct_idx = shuffled_options.index(correct_val)
-
-    return {
-        "q": final_q,
-        "o": shuffled_options,
-        "a": new_correct_idx
-    }
-
-# --- File Handling ---
-async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def handle_questions_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PROCESSED_DATA, ASKED_IDS
     doc = update.message.document
+    file_name = doc.file_name.lower()
+    
+    if not (file_name.endswith('.json') or file_name.endswith('.txt')):
+        return await update.message.reply_text("❌ केवल .json या .txt फ़ाइल अपलोड करें।")
+
+    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई! AI कथन-कारण और लॉजिकल प्रश्न तैयार कर रहा है... ⚡")
+    
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
-        data = json.loads(content.decode('utf-8'))
+        text_data = content.decode('utf-8').strip()
+        data = json.loads(text_data)
 
-        if isinstance(data, dict):
-            for key in data:
-                if isinstance(data[key], list):
-                    data = data[key]
-                    break
+        if isinstance(data, list) and len(data) > 0:
+            bulk_processed = await process_all_questions_in_bulk(data)
+            
+            PROCESSED_DATA["direct"] = [item["direct"] for item in bulk_processed]
+            PROCESSED_DATA["statement"] = [item["statement"] for item in bulk_processed]
+            PROCESSED_DATA["twisted"] = [item["twisted"] for item in bulk_processed]
+            
+            ASKED_IDS.clear()
+            
+            keyboard = [
+                [InlineKeyboardButton("📝 कथन-कारण टेस्ट शुरू करें", callback_data="mode_statement")],
+                [InlineKeyboardButton("🔄 घुमावदार (Twisted) टेस्ट शुरू करें", callback_data="mode_twisted")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
-        USER_DATA[user_id] = data
-
-        keyboard = [
-            [InlineKeyboardButton("🔄 कठिन भाषा (Twisted)", callback_data="mode_twisted")],
-            [InlineKeyboardButton("🔄 उल्टा क्विज़ (Reverse)", callback_data="mode_reverse")],
-            [InlineKeyboardButton("📝 कथन/कारण (Statement)", callback_data="mode_statement")]
-        ]
-        await update.message.reply_text(
-            f"✅ {len(data)} सवाल लोड हुए!\n\nAI हर बार प्रश्न का तरीका बदलेगा।", 
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+            await status_msg.edit_text(
+                f"✅ **{len(data)} प्रश्न सफलतापूर्वक प्रोसेस हो गए!**\n\n"
+                "⚡ सभी प्रकार के वेरिएशन्स तैयार हैं। कौन सा मोड खेलना चाहते हैं?", 
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            await status_msg.edit_text("❌ फ़ाइल में सही JSON लिस्ट प्रारूप नहीं है।")
     except Exception as e:
-        logger.error(f"Doc error: {e}")
-        await update.message.reply_text("❌ JSON फाइल का फॉर्मेट सही नहीं है।")
+        logger.error(f"File handling error: {e}")
+        await status_msg.edit_text("❌ फ़ाइल प्रोसेस करने में त्रुटि हुई। फ़ाइल फ़ॉर्मैट जांचें।")
 
-# --- Button Handler ---
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    mode = query.data
-
-    if user_id not in USER_DATA:
-        return await query.message.reply_text("❌ फाइल दोबारा भेजें।")
-
-    # सोचने वाला मैसेज
-    await query.edit_message_text(text="⚡ AI नया सवाल तैयार कर रहा है...")
-
-    q_data = await build_question(user_id, mode)
-
-    if q_data:
-        try:
-            await context.bot.send_poll(
-                chat_id=query.message.chat_id,
-                question=str(q_data['q'])[:300],
-                options=[str(o)[:100] for o in q_data['o']],
-                correct_option_id=int(q_data['a']),
-                type=Poll.QUIZ,
-                is_anonymous=False
-            )
-            keyboard = [[InlineKeyboardButton("अगला नया सवाल ➡️", callback_data=mode)]]
-            await context.bot.send_message(query.message.chat_id, "तैयार?", reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as e:
-            logger.error(f"Poll Error: {e}")
-            await context.bot.send_message(query.message.chat_id, "⚠️ पोल भेजने में समस्या आई।")
-    else:
-        await context.bot.send_message(query.message.chat_id, "❌ सवाल तैयार नहीं हो सका।")
-
-# --- Main ---
-async def main():
-    await start_web_server()
-    app = Application.builder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("अपनी JSON फाइल भेजें!")))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
-    app.add_handler(CallbackQueryHandler(button_click))
+    mode_map = {
+        "mode_direct": "direct",
+        "mode_statement": "statement",
+        "mode_twisted": "twisted"
+    }
 
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        await asyncio.Event().wait()
+    if query.data in mode_map:
+        await start_quiz_session_from_query(query, context, mode=mode_map[query.data])
+    elif query.data == "mode_reset":
+        global ASKED_IDS
+        ASKED_IDS.clear()
+        await query.edit_message_text("🧹 **सभी पूछे गए प्रश्नों की हिस्ट्री रीसेट कर दी गई है!**")
+
+async def start_quiz_session_from_query(query, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    global PROCESSED_DATA, ASKED_IDS
+    bank = PROCESSED_DATA.get(mode, [])
+    
+    if not bank:
+        return await query.message.reply_text("❌ कृपया पहले प्रश्नों वाली `.json` या `.txt` फ़ाइल अपलोड करें!")
+
+    unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
+
+    if not unasked_indices:
+        return await query.message.reply_text(
+            "🎉 **सभी प्रश्न समाप्त हो चुके हैं!**\n"
+            "पुनः शुरू करने के लिए रीसेट बटन दबाएं या `/reset` टाइप करें।"
+        )
+
+    count = 5
+    selected_indices = random.sample(unasked_indices, min(count, len(unasked_indices)))
+    
+    session_questions = []
+    for idx in selected_indices:
+        ASKED_IDS.add(idx)
+        session_questions.append(bank[idx])
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    context.application.user_data[user_id] = {
+        "quiz": session_questions,
+        "idx": 0,
+        "score": 0,
+        "total": len(session_questions),
+        "busy": True
+    }
+
+    await send_next_quiz(context, chat_id, user_id)
+
+async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    user_data = context.application.user_data.get(user_id)
+    if not user_data or not user_data.get("busy"):
+        return
+
+    idx = user_data.get("idx", 0)
+    quiz = user_data.get("quiz", [])
+    total = user_data.get("total", 0)
+
+    if idx >= total:
+        score = user_data.get("score", 0)
+        per = int((score / total) * 100) if total > 0 else 0
+        remaining = len(PROCESSED_DATA["direct"]) - len(ASKED_IDS)
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")],
+            [InlineKeyboardButton("📝 Statement Mode", callback_data="mode_statement")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        res = (
+            f"🎉 **क्विज़ समाप्त!**\n\n"
+            f"✅ सही उत्तर: {score} / {total}\n"
+            f"📊 स्कोर: {per}%\n"
+            f"📚 शेष नए सवाल: {remaining}"
+        )
+        await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=reply_markup)
+        user_data["busy"] = False
+        return
+
+    q = quiz[idx]
+    q_text = f"Q{idx + 1}/{total}. {q['question']}"
+    options = q['options']
+    correct_id = q['answer']
+
+    msg = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=q_text[:300],
+        options=[opt[:100] for opt in options],
+        type=Poll.QUIZ,
+        correct_option_id=correct_id,
+        is_anonymous=False
+    )
+
+    user_data["idx"] = idx + 1
+    POLL_TRACKER[msg.poll.id] = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "correct_option_id": correct_id
+    }
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll_answer = update.poll_answer
+    poll_id = poll_answer.poll_id
+
+    if poll_id not in POLL_TRACKER:
+        return
+
+    tracker = POLL_TRACKER.pop(poll_id)
+    user_id = tracker["user_id"]
+    chat_id = tracker["chat_id"]
+    correct_option_id = tracker["correct_option_id"]
+
+    if not poll_answer.option_ids:
+        return
+
+    selected = poll_answer.option_ids[0]
+    user_data = context.application.user_data.get(user_id)
+
+    if user_data and user_data.get("busy"):
+        if selected == correct_option_id:
+            user_data["score"] += 1
+        await send_next_quiz(context, chat_id, user_id)
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ASKED_IDS
+    ASKED_IDS.clear()
+    await update.message.reply_text("🧹 **हिस्ट्री रीसेट कर दी गई है!**")
+
+async def main():
+    ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("reset", reset_cmd))
+    ptb_app.add_handler(CallbackQueryHandler(button_handler))
+    ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_questions_file))
+    ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    await ptb_app.initialize()
+    await ptb_app.start()
+
+    webhook_url = f"{RENDER_URL}/{TOKEN}"
+    await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+
+    web_app = web.Application()
+
+    async def telegram_webhook(request):
+        try:
+            data = await request.json()
+            update = Update.de_json(data, ptb_app.bot)
+            await ptb_app.process_update(update)
+        except Exception as e:
+            logger.error(f"Error: {e}")
+        return web.Response(text="OK")
+
+    async def health_check(request):
+        return web.Response(text="Bot Alive")
+
+    web_app.router.add_post(f"/{TOKEN}", telegram_webhook)
+    web_app.router.add_get("/", health_check)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
