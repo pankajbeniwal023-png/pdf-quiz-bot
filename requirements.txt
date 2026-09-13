@@ -1,3 +1,5 @@
 python-telegram-bot
 aiohttp
 google-genai
+google-generativeai
+pypdf
