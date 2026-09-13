@@ -25,9 +25,10 @@ PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
 LAST_ERROR = "No error logged yet."
 USER_ASKED_IDS = {}
 POLL_TRACKER = {}
+USER_SESSIONS = {}  # mappingproxy एरर से बचने के लिए स्वतंत्र सेशन डिक्शनरी
 
 def parse_correct_answer(raw_answer, options):
-    """'A','B','C','D', 1-based (1,2,3,4) या स्ट्रिंग को Telegram के 0-indexed int में सुरक्षित बदलता है"""
+    """'A','B','C','D', 1-based (1,2,3,4) या स्ट्रिंग को Telegram के 0-indexed int में बदलता है"""
     if raw_answer is None:
         return 0
     if isinstance(raw_answer, int):
@@ -123,6 +124,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
+    USER_SESSIONS[user_id] = {"busy": False}
     
     if not PROCESSED_DATA["direct"]:
         await fetch_data_from_google_drive()
@@ -156,11 +158,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "mode_reset":
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
+        USER_SESSIONS[user_id] = {"busy": False}
         return await query.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!** नया मोड चुनें:", reply_markup=get_main_keyboard())
 
     if query.data == "mode_sync":
         success, err_msg = await fetch_data_from_google_drive()
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
+        USER_SESSIONS[user_id] = {"busy": False}
         if success:
             return await query.message.reply_text(f"✅ **डेटा सिंक हो गया!**\n\n`{err_msg}`", parse_mode="Markdown")
         else:
@@ -219,7 +223,8 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
             
             session_questions.append((idx, q_obj))
 
-        context.application.user_data[user_id] = {
+        # USER_SESSIONS का उपयोग (mappingproxy एरर ठीक)
+        USER_SESSIONS[user_id] = {
             "mode": mode,
             "quiz": session_questions,
             "idx": 0,
@@ -228,7 +233,6 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
             "busy": True
         }
 
-        # सवाल भेजना शुरू करें
         await send_next_quiz(context, chat_id, user_id)
 
     except Exception as e:
@@ -236,7 +240,7 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
         await context.bot.send_message(chat_id, f"❌ **सत्र शुरू करने में एरर:**\n`{str(e)}`")
 
 async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    user_data = context.application.user_data.get(user_id)
+    user_data = USER_SESSIONS.get(user_id)
     if not user_data or not user_data.get("busy"):
         return
 
@@ -256,12 +260,10 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     question_index, q = quiz[idx]
 
     try:
-        # सवाल का टेक्स्ट निकालें
         raw_q = q.get('question') or q.get('q') or "सवाल उपलब्ध नहीं है"
         clean_question = str(raw_q).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "").strip()
         poll_question = f"Q{idx + 1}/{total}. {clean_question}"[:295]
 
-        # ऑप्शन्स निकालें
         raw_options = q.get('options') or q.get('choices') or []
         if isinstance(raw_options, dict):
             poll_options = [str(v).strip()[:95] for v in raw_options.values() if str(v).strip()]
@@ -270,18 +272,14 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
         else:
             poll_options = []
 
-        # अगर ऑप्शन्स 2 से कम हैं तो टेलीग्राम पोल नहीं भेजता
         while len(poll_options) < 2:
             poll_options.append(f"विकल्प {len(poll_options)+1}")
 
-        # टेलीग्राम अधिकतम 10 ऑप्शन की अनुमति देता है
         poll_options = poll_options[:10]
 
-        # उत्तर निकालें
         raw_answer = q.get('answer') if q.get('answer') is not None else q.get('correct')
         correct_id = parse_correct_answer(raw_answer, poll_options)
 
-        # टेलीग्राम पर पोल भेजें
         msg = await context.bot.send_poll(
             chat_id=chat_id,
             question=poll_question,
@@ -298,10 +296,9 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     except Exception as e:
         err_detail = traceback.format_exc()
         logger.error(f"Poll Send Failed on Q{idx+1}: {err_detail}")
-        # चैट में एरर भेजें ताकि आपको पता चले कि क्या गड़बड़ है
         await context.bot.send_message(
             chat_id, 
-            f"⚠️ **सवाल Q{idx+1} भेजने में एरर आया:**\n`{str(e)}`\n\nकृपया JSON फ़ाइल में इस सवाल का प्रारूप जांचें।"
+            f"⚠️ **सवाल Q{idx+1} भेजने में एरर आया:**\n`{str(e)}`"
         )
         user_data["idx"] = idx + 1
         await send_next_quiz(context, chat_id, user_id)
@@ -318,7 +315,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = tracker["chat_id"]
 
     if poll_answer.option_ids and poll_answer.option_ids[0] == tracker["correct_option_id"]:
-        user_data = context.application.user_data.get(user_id)
+        user_data = USER_SESSIONS.get(user_id)
         if user_data:
             user_data["score"] += 1
 
