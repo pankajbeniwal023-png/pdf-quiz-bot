@@ -20,25 +20,21 @@ TOKEN = os.environ.get("BOT_TOKEN")
 RENDER_URL = os.environ.get("RENDER_URL")
 DRIVE_FILE_ID = os.environ.get("DRIVE_FILE_ID")
 
-# Global Storage
 PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
 USER_ASKED_IDS = {}
 POLL_TRACKER = {}
 
 async def fetch_data_from_google_drive():
-    """Robust parser to handle JSON structure and clean up escape characters"""
     global PROCESSED_DATA
     if not DRIVE_FILE_ID:
-        logger.error("DRIVE_FILE_ID environment variable missing!")
         return False
         
     url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
     try:
         async with ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     text_data = await resp.text()
-                    # Clean markdown and common text anomalies from raw text
                     clean_text = text_data.strip().replace("```json", "").replace("```", "")
                     raw_data = json.loads(clean_text)
                     
@@ -54,17 +50,16 @@ async def fetch_data_from_google_drive():
                     PROCESSED_DATA["direct"] = direct_list
                     PROCESSED_DATA["statement"] = statement_list
                     PROCESSED_DATA["twisted"] = twisted_list
-                    
-                    logger.info(f"Loaded Direct:{len(direct_list)} | Statement:{len(statement_list)} | Twisted:{len(twisted_list)}")
                     return True
-                else:
-                    logger.error(f"Drive fetch failed: {resp.status}")
-                    return False
+                return False
     except Exception as e:
-        logger.error(f"Drive Sync Exception: {e}")
+        logger.error(f"Drive Exception: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
+    
     if not PROCESSED_DATA["direct"]:
         await fetch_data_from_google_drive()
         
@@ -78,59 +73,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Drive Sync", callback_data="mode_sync")
         ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    msg = (
-        "🧠 **Google Drive Integrated Quiz Bot**\n\n"
-        "1. गूगल ड्राइव से सवाल 100% ऑटो-सिंक हो चुके हैं।\n"
-        "2. बटन दबाते ही **0.1 सेकंड** में नया सवाल आएगा!"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
-
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement"),
-            InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")
-        ],
-        [InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct")]
-    ]
-    await update.message.reply_text(
-        "🧹 **आपकी हिस्ट्री सफलता पूर्वक रीसेट हो गई है!**\n\nअब नया टेस्ट शुरू करने के लिए मोड चुनें:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    msg = "🧠 **Quiz Bot Ready!**\n\nनीचे दिए गए बटन पर क्लिक करके खेलना शुरू करें:"
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    await query.answer()
+    
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if query.data == "mode_reset":
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
         keyboard = [
             [
-                InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement"),
-                InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")
+                InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct"),
+                InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement")
             ],
-            [InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct")]
+            [InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")]
         ]
-        return await query.message.reply_text(
-            "🧹 **आपकी हिस्ट्री रीसेट हो गई है!**\nनीचे बटन दबाकर क्विज़ शुरू करें:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        return await query.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!** नया मोड चुनें:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     if query.data == "mode_sync":
         success = await fetch_data_from_google_drive()
+        USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
         if success:
-            USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
-            total_loaded = len(PROCESSED_DATA["direct"])
-            return await query.message.reply_text(f"✅ **Google Drive से {total_loaded} नए सवाल सिंक हो गए हैं!**")
+            return await query.message.reply_text("✅ **Google Drive से नया डेटा सिंक हो गया!**")
         else:
-            return await query.message.reply_text("❌ Google Drive से फ़ाइल सिंक करने में समस्या आई। Drive File ID व Permissions जांचें।")
+            return await query.message.reply_text("❌ Drive Sync फेल हो गया। Permissions चेक करें।")
 
     mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
     selected_mode = mode_map.get(query.data)
@@ -138,14 +111,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_quiz_session(query.message.chat_id, user_id, context, mode=selected_mode)
 
 async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    global PROCESSED_DATA, USER_ASKED_IDS
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
         await fetch_data_from_google_drive()
         bank = PROCESSED_DATA.get(mode, [])
         if not bank:
-            return await context.bot.send_message(chat_id, "❌ Google Drive फ़ाइल में इस मोड के सवाल नहीं मिले! AI Studio का JSON फ़ॉर्मेट चेक करें।")
+            return await context.bot.send_message(chat_id, "❌ Drive में इस मोड के सवाल नहीं मिले!")
 
     if user_id not in USER_ASKED_IDS:
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
@@ -154,10 +126,10 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
     unasked_indices = [i for i in range(len(bank)) if i not in asked]
 
     if not unasked_indices:
-        keyboard = [[InlineKeyboardButton("🧹 रीसेट करें", callback_data="mode_reset")]]
+        keyboard = [[InlineKeyboardButton("🧹 रीसेट करके पुनः खेलें", callback_data="mode_reset")]]
         return await context.bot.send_message(
             chat_id,
-            "🎉 **इस मोड के सभी सवाल समाप्त हो चुके हैं!**\n\nदोबारा खेलने के लिए नीचे **रीसेट करें** बटन दबाएं।",
+            "🎉 **इस फ़ाइल के सभी सवाल समाप्त हो चुके हैं!**\n\nफिर से खेलने के लिए रीसेट बटन दबाएं:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -199,20 +171,22 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
             ],
             [InlineKeyboardButton("🎯 Direct Mode", callback_data="mode_direct")]
         ]
-        res = f"🎉 **क्विज़ पूरा हुआ!**\n\n✅ सही उत्तर: {score}/{total}\n📊 स्कोर: {per}%"
+        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही: {score}/{total}\n📊 स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         user_data["busy"] = False
         return
 
     q = quiz[idx]
-    
-    # Text sanitization to fix illegal formatting characters from AI JSON
     clean_question = str(q['question']).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "")
+
+    # Clean and slice text to strictly adhere to Telegram Poll limits
+    poll_question = f"Q{idx + 1}/{total}. {clean_question}"[:295]
+    poll_options = [str(opt)[:95] for opt in q['options']]
 
     msg = await context.bot.send_poll(
         chat_id=chat_id,
-        question=f"Q{idx + 1}/{total}. {clean_question}"[:300],
-        options=[str(opt)[:100] for opt in q['options']],
+        question=poll_question,
+        options=poll_options,
         type=Poll.QUIZ,
         correct_option_id=q['answer'],
         is_anonymous=False
@@ -243,8 +217,7 @@ async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("reset", reset_cmd))
-    ptb_app.add_handler(CommandHandler("sync", reset_cmd))
+    ptb_app.add_handler(CommandHandler("reset", start))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
