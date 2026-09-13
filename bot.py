@@ -22,12 +22,12 @@ DRIVE_FILE_ID = os.environ.get("DRIVE_FILE_ID")
 
 # Global Storage
 PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
-ASKED_IDS = set()
+USER_ASKED_IDS = {}  # Per-user asked questions set
 POLL_TRACKER = {}
 
 async def fetch_data_from_google_drive():
-    """Fetch JSON data from Google Drive public link with zero API lag"""
-    global PROCESSED_DATA, ASKED_IDS
+    """Fetch JSON data from Google Drive public link"""
+    global PROCESSED_DATA
     if not DRIVE_FILE_ID:
         logger.error("DRIVE_FILE_ID Environment variable not set!")
         return False
@@ -44,8 +44,7 @@ async def fetch_data_from_google_drive():
                     PROCESSED_DATA["statement"] = [item["statement"] for item in raw_json if "statement" in item]
                     PROCESSED_DATA["twisted"] = [item["twisted"] for item in raw_json if "twisted" in item]
                     
-                    ASKED_IDS.clear()
-                    logger.info(f"Successfully loaded {len(raw_json)} questions from Google Drive.")
+                    logger.info(f"Loaded {len(raw_json)} questions from Google Drive.")
                     return True
                 else:
                     logger.error(f"Failed to fetch Google Drive file. Status code: {resp.status}")
@@ -55,7 +54,6 @@ async def fetch_data_from_google_drive():
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Auto-load data if empty
     if not PROCESSED_DATA["direct"]:
         await fetch_data_from_google_drive()
         
@@ -73,23 +71,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = (
         "🧠 **Google Drive Integrated Quiz Bot**\n\n"
-        "1. गूगल ड्राइव से सभी प्रश्नों के कथन-कारण और Twisted वर्ज़न सिंक हो चुके हैं।\n"
-        "2. नीचे दिए गए बटन पर क्लिक करें। **माइक्रो-सेकंड** में हर बार नया घुमावदार सवाल मिलेगा!"
+        "1. गूगल ड्राइव से सवाल 100% ऑटो-सिंक हो चुके हैं।\n"
+        "2. बटन दबाते ही **0.1 सेकंड** में नया घुमावदार सवाल आएगा!"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
 
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real Reset Handler for /reset command"""
+    user_id = update.effective_user.id
+    USER_ASKED_IDS[user_id] = set()
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement"),
+            InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")
+        ],
+        [InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct")]
+    ]
+    await update.message.reply_text(
+        "🧹 **आपकी हिस्ट्री सफलता पूर्वक रीसेट हो गई है!**\n\nअब नया टेस्ट शुरू करने के लिए मोड चुनें:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
     await query.answer()
 
     if query.data == "mode_reset":
-        global ASKED_IDS
-        ASKED_IDS.clear()
-        return await query.message.reply_text("🧹 **पूछे गए सवालों की हिस्ट्री रीसेट हो गई है!**")
+        USER_ASKED_IDS[user_id] = set()
+        keyboard = [
+            [
+                InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement"),
+                InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")
+            ]
+        ]
+        return await query.message.reply_text(
+            "🧹 **आपकी हिस्ट्री रीसेट हो गई है!**\nनीचे बटन दबाकर क्विज़ शुरू करें:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     if query.data == "mode_sync":
         success = await fetch_data_from_google_drive()
         if success:
+            USER_ASKED_IDS[user_id] = set()
             return await query.message.reply_text(f"✅ **Google Drive से {len(PROCESSED_DATA['direct'])} नए सवाल सिंक हो गए हैं!**")
         else:
             return await query.message.reply_text("❌ Google Drive से फ़ाइल सिंक करने में समस्या आई। File ID जांचें।")
@@ -97,25 +123,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
     selected_mode = mode_map.get(query.data)
     if selected_mode:
-        await start_quiz_session(query.message.chat_id, query.from_user.id, context, mode=selected_mode)
+        await start_quiz_session(query.message.chat_id, user_id, context, mode=selected_mode)
 
 async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    global PROCESSED_DATA, ASKED_IDS
+    global PROCESSED_DATA, USER_ASKED_IDS
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
         await fetch_data_from_google_drive()
         bank = PROCESSED_DATA.get(mode, [])
         if not bank:
-            return await context.bot.send_message(chat_id, "❌ Google Drive में सवाल नहीं मिले! पहले फ़ाइल अपलोड करें।")
+            return await context.bot.send_message(chat_id, "❌ Google Drive में सवाल नहीं मिले! फ़ाइल सही अपलोड करें।")
 
-    unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
+    if user_id not in USER_ASKED_IDS:
+        USER_ASKED_IDS[user_id] = set()
+
+    asked = USER_ASKED_IDS[user_id]
+    unasked_indices = [i for i in range(len(bank)) if i not in asked]
 
     if not unasked_indices:
         keyboard = [[InlineKeyboardButton("🧹 रीसेट करें", callback_data="mode_reset")]]
         return await context.bot.send_message(
             chat_id,
-            "🎉 **सभी सवाल समाप्त हो चुके हैं!**\nदोबारा शुरू करने के लिए रीसेट दबाएं।",
+            "🎉 **इस फ़ाइल के सभी सवाल समाप्त हो चुके हैं!**\n\nदोबारा खेलने के लिए नीचे **रीसेट करें** बटन दबाएं।",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -124,7 +154,7 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
     
     session_questions = []
     for idx in selected_indices:
-        ASKED_IDS.add(idx)
+        USER_ASKED_IDS[user_id].add(idx)
         session_questions.append(bank[idx])
 
     context.application.user_data[user_id] = {
@@ -154,7 +184,8 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
             [
                 InlineKeyboardButton("📝 Statement Mode", callback_data="mode_statement"),
                 InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")
-            ]
+            ],
+            [InlineKeyboardButton("🎯 Direct Mode", callback_data="mode_direct")]
         ]
         res = f"🎉 **क्विज़ पूरा हुआ!**\n\n✅ सही उत्तर: {score}/{total}\n📊 स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -192,25 +223,18 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await send_next_quiz(context, chat_id, user_id)
 
-async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    success = await fetch_data_from_google_drive()
-    if success:
-        await update.message.reply_text(f"✅ **Google Drive से {len(PROCESSED_DATA['direct'])} नए सवाल सिंक हो गए!**")
-    else:
-        await update.message.reply_text("❌ सिंक करने में एरर आई।")
-
 async def main():
     ptb_app = Application.builder().token(TOKEN).concurrent_updates(True).build()
 
     ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("sync", sync_cmd))
+    ptb_app.add_handler(CommandHandler("reset", reset_cmd))
+    ptb_app.add_handler(CommandHandler("sync", reset_cmd))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await ptb_app.initialize()
     await ptb_app.start()
 
-    # Initial Sync on Boot
     await fetch_data_from_google_drive()
 
     webhook_url = f"{RENDER_URL}/{TOKEN}"
