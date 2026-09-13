@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import random
+import traceback
 from aiohttp import web, ClientSession
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,7 +27,7 @@ USER_ASKED_IDS = {}
 POLL_TRACKER = {}
 
 def parse_correct_answer(raw_answer, options):
-    """'A','B','C','D' या 1-based (1,2,3,4) या स्ट्रिंग को Telegram के 0-indexed int में बदलता है"""
+    """'A','B','C','D', 1-based (1,2,3,4) या स्ट्रिंग को Telegram के 0-indexed int में सुरक्षित बदलता है"""
     if raw_answer is None:
         return 0
     if isinstance(raw_answer, int):
@@ -89,7 +90,7 @@ async def fetch_data_from_google_drive():
                     
                     total_count = len(direct_list) + len(statement_list) + len(twisted_list)
                     if total_count == 0:
-                        LAST_ERROR = "Drive file fetched, but 0 questions parsed."
+                        LAST_ERROR = "Drive file fetched, but 0 questions parsed from JSON keys."
                         return False, LAST_ERROR
                     
                     LAST_ERROR = f"Loaded {len(direct_list)} direct, {len(statement_list)} statement, {len(twisted_list)} twisted."
@@ -126,16 +127,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not PROCESSED_DATA["direct"]:
         await fetch_data_from_google_drive()
         
-    msg = "🧠 **Quiz Bot Ready!**\n\nअपनी पसंद का मोड चुनें और रिवीजन शुरू करें:"
+    msg = "🧠 **Quiz Bot Ready!**\n\nअपनी पसंद का मोड चुनें और खेलना शुरू करें:"
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 async def debug_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sample = "None"
+    if PROCESSED_DATA["direct"]:
+        sample = json.dumps(PROCESSED_DATA["direct"][0], ensure_ascii=False)[:300]
+
     status_msg = (
         f"🛠 **Debug Report:**\n\n"
         f"• **Direct Questions:** {len(PROCESSED_DATA['direct'])}\n"
         f"• **Statement Questions:** {len(PROCESSED_DATA['statement'])}\n"
-        f"• **Twisted Questions:** {len(PROCESSED_DATA['twisted'])}\n\n"
-        f"• **Last Log:** `{LAST_ERROR}`"
+        f"• **Twisted Questions:** {len(PROCESSED_DATA['twisted'])}\n"
+        f"• **Last Log:** `{LAST_ERROR}`\n\n"
+        f"• **Sample Question 1:**\n`{sample}`"
     )
     await update.message.reply_text(status_msg, parse_mode="Markdown")
 
@@ -156,7 +162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success, err_msg = await fetch_data_from_google_drive()
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
         if success:
-            return await query.message.reply_text(f"✅ **Google Drive डेटा सिंक हो गया!**\n\n`{err_msg}`", parse_mode="Markdown")
+            return await query.message.reply_text(f"✅ **डेटा सिंक हो गया!**\n\n`{err_msg}`", parse_mode="Markdown")
         else:
             return await query.message.reply_text(f"❌ **Drive Sync एरर:**\n\n`{err_msg}`", parse_mode="Markdown")
 
@@ -171,59 +177,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_quiz_session(query.message.chat_id, user_id, context, mode=selected_mode)
 
 async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    if not PROCESSED_DATA["direct"]:
-        success, err_msg = await fetch_data_from_google_drive()
-        if not success:
-            return await context.bot.send_message(chat_id, f"❌ **डेटा लोड नहीं हो पाया:**\n`{err_msg}`", parse_mode="Markdown")
+    try:
+        if not PROCESSED_DATA["direct"]:
+            success, err_msg = await fetch_data_from_google_drive()
+            if not success:
+                return await context.bot.send_message(chat_id, f"❌ **डेटा लोड एरर:**\n`{err_msg}`", parse_mode="Markdown")
 
-    if user_id not in USER_ASKED_IDS:
-        USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
+        if user_id not in USER_ASKED_IDS:
+            USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set(), "mix": set()}
 
-    total_pool_size = max(len(PROCESSED_DATA["direct"]), len(PROCESSED_DATA["statement"]), len(PROCESSED_DATA["twisted"]))
-    
-    asked = USER_ASKED_IDS[user_id].get(mode, set())
-    unasked_indices = [i for i in range(total_pool_size) if i not in asked]
-
-    if not unasked_indices:
-        keyboard = [[InlineKeyboardButton("🧹 रीसेट करके पुनः खेलें", callback_data="mode_reset")]]
-        return await context.bot.send_message(
-            chat_id,
-            "🎉 **इस फ़ाइल के सभी सवाल समाप्त हो चुके हैं!**\n\nफिर से खेलने के लिए रीसेट बटन दबाएं:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-    selected_indices = random.sample(unasked_indices, min(5, len(unasked_indices)))
-    
-    session_questions = []
-    for idx in selected_indices:
-        # अगर मिक्स मोड है तो हर सवाल के लिए रैंडम स्टाइल चुनें
         if mode == "mix":
-            possible_types = [t for t in ["direct", "statement", "twisted"] if idx < len(PROCESSED_DATA[t])]
-            chosen_type = random.choice(possible_types) if possible_types else "direct"
-            q_obj = PROCESSED_DATA[chosen_type][idx]
+            pool_size = max(len(PROCESSED_DATA["direct"]), len(PROCESSED_DATA["statement"]), len(PROCESSED_DATA["twisted"]))
         else:
-            bank = PROCESSED_DATA.get(mode, [])
-            if idx < len(bank):
-                q_obj = bank[idx]
-            else:
-                continue
+            pool_size = len(PROCESSED_DATA.get(mode, []))
+
+        if pool_size == 0:
+            return await context.bot.send_message(chat_id, f"❌ '{mode}' मोड में कोई सवाल नहीं मिला। Drive Sync दबाएं या `/debug` चेक करें।")
+
+        asked = USER_ASKED_IDS[user_id].get(mode, set())
+        unasked_indices = [i for i in range(pool_size) if i not in asked]
+
+        if not unasked_indices:
+            keyboard = [[InlineKeyboardButton("🧹 रीसेट करके पुनः खेलें", callback_data="mode_reset")]]
+            return await context.bot.send_message(
+                chat_id,
+                "🎉 **इस फ़ाइल के सभी सवाल समाप्त हो चुके हैं!**\n\nफिर से खेलने के लिए रीसेट बटन दबाएं:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+
+        selected_indices = random.sample(unasked_indices, min(5, len(unasked_indices)))
         
-        session_questions.append((idx, q_obj))
+        session_questions = []
+        for idx in selected_indices:
+            if mode == "mix":
+                possible_types = [t for t in ["direct", "statement", "twisted"] if idx < len(PROCESSED_DATA[t])]
+                chosen_type = random.choice(possible_types) if possible_types else "direct"
+                q_obj = PROCESSED_DATA[chosen_type][idx]
+            else:
+                q_obj = PROCESSED_DATA[mode][idx]
+            
+            session_questions.append((idx, q_obj))
 
-    if not session_questions:
-        return await context.bot.send_message(chat_id, "⚠️ कोई सवाल उपलब्ध नहीं है। कृपया `/debug` चेक करें।")
+        context.application.user_data[user_id] = {
+            "mode": mode,
+            "quiz": session_questions,
+            "idx": 0,
+            "score": 0,
+            "total": len(session_questions),
+            "busy": True
+        }
 
-    context.application.user_data[user_id] = {
-        "mode": mode,
-        "quiz": session_questions,
-        "idx": 0,
-        "score": 0,
-        "total": len(session_questions),
-        "busy": True
-    }
+        # सवाल भेजना शुरू करें
+        await send_next_quiz(context, chat_id, user_id)
 
-    await send_next_quiz(context, chat_id, user_id)
+    except Exception as e:
+        logger.error(f"Error starting session: {e}\n{traceback.format_exc()}")
+        await context.bot.send_message(chat_id, f"❌ **सत्र शुरू करने में एरर:**\n`{str(e)}`")
 
 async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     user_data = context.application.user_data.get(user_id)
@@ -238,28 +248,40 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
     if idx >= total:
         score = user_data.get("score", 0)
         per = int((score / total) * 100) if total > 0 else 0
-        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही: {score}/{total}\n📊 स्कोर: {per}%"
+        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही उत्तर: {score}/{total}\n📊 आपका स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=get_main_keyboard())
         user_data["busy"] = False
         return
 
     question_index, q = quiz[idx]
-    
+
     try:
-        clean_question = str(q.get('question', '')).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "")
+        # सवाल का टेक्स्ट निकालें
+        raw_q = q.get('question') or q.get('q') or "सवाल उपलब्ध नहीं है"
+        clean_question = str(raw_q).replace("|\\n", "\n").replace("\\n", "\n").replace("|", "").strip()
         poll_question = f"Q{idx + 1}/{total}. {clean_question}"[:295]
-        
-        raw_options = q.get('options', [])
+
+        # ऑप्शन्स निकालें
+        raw_options = q.get('options') or q.get('choices') or []
         if isinstance(raw_options, dict):
-            poll_options = [str(v)[:95] for v in raw_options.values()]
+            poll_options = [str(v).strip()[:95] for v in raw_options.values() if str(v).strip()]
+        elif isinstance(raw_options, list):
+            poll_options = [str(opt).strip()[:95] for opt in raw_options if str(opt).strip()]
         else:
-            poll_options = [str(opt)[:95] for opt in raw_options]
+            poll_options = []
 
-        if len(poll_options) < 2:
-            poll_options.append("इनमें से कोई नहीं")
+        # अगर ऑप्शन्स 2 से कम हैं तो टेलीग्राम पोल नहीं भेजता
+        while len(poll_options) < 2:
+            poll_options.append(f"विकल्प {len(poll_options)+1}")
 
-        correct_id = parse_correct_answer(q.get('answer'), poll_options)
+        # टेलीग्राम अधिकतम 10 ऑप्शन की अनुमति देता है
+        poll_options = poll_options[:10]
 
+        # उत्तर निकालें
+        raw_answer = q.get('answer') if q.get('answer') is not None else q.get('correct')
+        correct_id = parse_correct_answer(raw_answer, poll_options)
+
+        # टेलीग्राम पर पोल भेजें
         msg = await context.bot.send_poll(
             chat_id=chat_id,
             question=poll_question,
@@ -269,14 +291,18 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
             is_anonymous=False
         )
 
-        # सवाल सफलतापूर्वक सेंड होने के बाद ही उसे Asked लिस्ट में जोड़ें
         USER_ASKED_IDS[user_id][mode].add(question_index)
         user_data["idx"] = idx + 1
         POLL_TRACKER[msg.poll.id] = {"user_id": user_id, "chat_id": chat_id, "correct_option_id": correct_id}
 
     except Exception as e:
-        logger.error(f"Poll Send Error on Q{idx+1}: {e}")
-        # अगर किसी सवाल में कोई फॉर्मेट एरर हो तो अगले सवाल पर बढ़ें
+        err_detail = traceback.format_exc()
+        logger.error(f"Poll Send Failed on Q{idx+1}: {err_detail}")
+        # चैट में एरर भेजें ताकि आपको पता चले कि क्या गड़बड़ है
+        await context.bot.send_message(
+            chat_id, 
+            f"⚠️ **सवाल Q{idx+1} भेजने में एरर आया:**\n`{str(e)}`\n\nकृपया JSON फ़ाइल में इस सवाल का प्रारूप जांचें।"
+        )
         user_data["idx"] = idx + 1
         await send_next_quiz(context, chat_id, user_id)
 
