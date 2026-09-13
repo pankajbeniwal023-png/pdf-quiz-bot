@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import random
+import re
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,31 +32,37 @@ PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
 ASKED_IDS = set()
 POLL_TRACKER = {}
 
-# Robust AI Generator with Chunking to prevent AI Failure
+def clean_json_response(text: str):
+    """Clean markdown backticks and extract raw JSON"""
+    text = text.strip()
+    match = re.search(r'\[.*\]', text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return text
+
 async def generate_variations_from_text(input_text: str):
     prompt = f"""
-You are an expert exam paper setter. Analyze the input text/facts/questions and generate comprehensive multiple-choice quiz items in Hindi.
+Strictly extract study concepts from text and format into a JSON array of quiz questions in Hindi.
 
-Create 3 distinct variations for each question derived from the text:
-1. "direct": Standard fact question.
-2. "statement": Strict Assertion-Reason style in Hindi.
-   - Question format MUST be: "कथन (A): ... \nकारण (R): ..."
-   - Options MUST be standard UPSC format:
+For each concept, make 3 modes:
+1. "direct": Simple factual MCQ.
+2. "statement": Assertion-Reason style in Hindi.
+   - Question: "कथन (A): ... \nकारण (R): ..."
+   - Options MUST be:
      0: कथन (A) और कारण (R) दोनों सही हैं और (R), (A) की सही व्याख्या है।
      1: कथन (A) और कारण (R) दोनों सही हैं लेकिन (R), (A) की सही व्याख्या नहीं है।
      2: कथन (A) सही है लेकिन कारण (R) गलत है।
      3: कथन (A) गलत है लेकिन कारण (R) सही है।
-3. "twisted": Reframe the question conceptually/analytically to test understanding beyond rote memory.
+3. "twisted": Rephrase question analytically.
 
-Input Content:
-{input_text}
+Input Text:
+{input_text[:3000]}
 
-Output Rules:
-- Return ONLY valid JSON array with structure:
+Respond ONLY with valid JSON array:
 [
   {{
     "direct": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}},
-    "statement": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}},
+    "statement": {{"question": "...", "options": ["कथन (A) और कारण (R)...", "..."], "answer": 0}},
     "twisted": {{"question": "...", "options": ["...", "...", "...", "..."], "answer": 0}}
   }}
 ]
@@ -67,12 +74,13 @@ Output Rules:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.6,
+                temperature=0.3,
             ),
         )
-        return json.loads(response.text.strip())
+        cleaned_json = clean_json_response(response.text)
+        return json.loads(cleaned_json)
     except Exception as e:
-        logger.error(f"AI Chunk Error: {e}")
+        logger.error(f"AI Generation Warning: {e}")
         return []
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -89,21 +97,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     msg = (
-        "🧠 **100% Reliable Quiz Generator Bot**\n\n"
-        "1. कोई भी **फोटो (Image), PDF, JSON या सीधे टेक्स्ट नोट्स** भेजें।\n"
-        "2. बॉट बिना फ़ेल हुए ऑटोमैटिक सभी प्रश्नों के कथन-कारण और लॉजिकल वर्ज़न तैयार कर लेगा।\n"
-        "3. बटन दबाते ही **0.1 सेकंड** में नए तरीके से सवाल चालू हो जाएंगे!"
+        "🧠 **100% Fail-Proof Quiz Bot**\n\n"
+        "1. अपनी फोटो (Image), `.txt` या कोई भी टेक्स्ट नोट्स भेजें।\n"
+        "2. AI तुरंत बैकग्राउंड में सभी मोड तैयार कर लेगा।\n"
+        "3. बटन दबाते ही **0.1 सेकंड (माइक्रो-सेकंड)** में सवाल आ जाएंगे!"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
 
-# Handle Images with Text Extraction
+# Document & Text Processing
+async def handle_document_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई! 100% ऑटो-प्रोसेसिंग जारी है... ⚡")
+    
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        content = await file.download_as_bytearray()
+        text_data = content.decode('utf-8', errors='ignore').strip()
+        
+        # Split text into safe chunks to prevent API failure
+        lines = [line for line in text_data.split("\n") if line.strip()]
+        chunk_size = 15
+        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+        
+        all_results = []
+        for chunk in chunks:
+            chunk_text = "\n".join(chunk)
+            if chunk_text.strip():
+                res = await generate_variations_from_text(chunk_text)
+                if isinstance(res, list):
+                    all_results.extend(res)
+                await asyncio.sleep(0.5) # Avoid rate limits
+                
+        if all_results:
+            store_processed_results(all_results)
+            await finalize_upload_response(status_msg, len(all_results))
+        else:
+            await status_msg.edit_text("❌ कंटेंट बहुत छोटा था या समझ नहीं आया। थोड़ा और स्पष्ट टेक्स्ट भेजें।")
+            
+    except Exception as e:
+        logger.error(f"Document Error: {e}")
+        await status_msg.edit_text("❌ फ़ाइल रीड करने में समस्या आई।")
+
+# Handle Image Input
 async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("📸 इमेज मिल गई! AI फोटो से प्रश्न और कथन-कारण बना रहा है... ⚡")
+    status_msg = await update.message.reply_text("📸 फोटो मिल गई! AI प्रश्न और कथन-कारण बना रहा है... ⚡")
     try:
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         
-        prompt = "Extract all study facts or questions from this image and convert into JSON format."
+        prompt = "Extract study text/facts from this image and list them clearly as plain text."
         
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
@@ -115,49 +157,16 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         extracted_text = response.text.strip()
         
-        # Process extracted content
         results = await generate_variations_from_text(extracted_text)
         if results:
             store_processed_results(results)
             await finalize_upload_response(status_msg, len(results))
         else:
-            await status_msg.edit_text("❌ इमेज से सवाल जनरेट करने में असमर्थ। कृपया साफ़ फोटो भेजें।")
+            await status_msg.edit_text("❌ फोटो से प्रश्न नहीं बन पाए। कृपया साफ फोटो भेजें।")
             
     except Exception as e:
-        logger.error(f"Image Error: {e}")
-        await status_msg.edit_text("❌ इमेज प्रोसेस करने में एरर आई।")
-
-# Handle Document (PDF / JSON / TXT)
-async def handle_document_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    status_msg = await update.message.reply_text("📥 फ़ाइल मिल गई! सुरक्षित चंकिंग प्रोसेसिंग जारी है... ⚡")
-    
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        content = await file.download_as_bytearray()
-        text_data = content.decode('utf-8', errors='ignore').strip()
-        
-        # Chunking Text into smaller blocks to prevent Gemini API Failure
-        lines = text_data.split("\n")
-        chunk_size = 30  # Process line groups
-        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
-        
-        all_results = []
-        for chunk in chunks:
-            chunk_text = "\n".join(chunk)
-            if chunk_text.strip():
-                res = await generate_variations_from_text(chunk_text)
-                all_results.extend(res)
-                
-        if all_results:
-            store_processed_results(all_results)
-            await finalize_upload_response(status_msg, len(all_results))
-        else:
-            await status_msg.edit_text("❌ कंटेंट से सवाल जनरेट नहीं हो सके।")
-            
-    except Exception as e:
-        logger.error(f"Document Error: {e}")
-        await status_msg.edit_text("❌ फ़ाइल रीड करने में समस्या आई।")
+        logger.error(f"Photo Error: {e}")
+        await status_msg.edit_text("❌ फोटो प्रोसेस करने में त्रुटि आई।")
 
 def store_processed_results(results_list):
     global PROCESSED_DATA, ASKED_IDS
@@ -175,8 +184,8 @@ async def finalize_upload_response(status_msg, count):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await status_msg.edit_text(
-        f"✅ **{count} नए प्रश्न तैयार हो गए हैं!**\n\n"
-        "⚡ नीचे बटन दबाते ही बिना 1 सेकंड गंवाए टेस्ट शुरू होगा:", 
+        f"✅ **{count} प्रश्न सफलता पूर्वक तैयार हो गए!**\n\n"
+        "⚡ अब बटन पर क्लिक करें, बिना किसी लैग के नया सवाल आएगा:", 
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -200,7 +209,7 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
-        return await context.bot.send_message(chat_id, "❌ पहले नोट्स, इमेज या फ़ाइल भेजें!")
+        return await context.bot.send_message(chat_id, "❌ पहले नोट्स, फोटो या फ़ाइल अपलोड करें!")
 
     unasked_indices = [i for i in range(len(bank)) if i not in ASKED_IDS]
 
@@ -249,7 +258,7 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
                 InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")
             ]
         ]
-        res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही: {score}/{total}\n📊 स्कोर: {per}%"
+        res = f"🎉 **क्विज़ पूरा हुआ!**\n\n✅ सही उत्तर: {score}/{total}\n📊 स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         user_data["busy"] = False
         return
@@ -292,6 +301,7 @@ async def main():
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
     ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document_input))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_document_input))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await ptb_app.initialize()
