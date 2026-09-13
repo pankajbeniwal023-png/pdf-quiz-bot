@@ -19,18 +19,16 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("BOT_TOKEN")
 RENDER_URL = os.environ.get("RENDER_URL")
 DRIVE_FILE_ID = os.environ.get("DRIVE_FILE_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 PROCESSED_DATA = {"direct": [], "statement": [], "twisted": []}
-LAST_ERROR = "No error logged yet."
 USER_ASKED_IDS = {}
 POLL_TRACKER = {}
 
 async def fetch_data_from_google_drive():
-    global PROCESSED_DATA, LAST_ERROR
+    global PROCESSED_DATA
     if not DRIVE_FILE_ID:
-        LAST_ERROR = "DRIVE_FILE_ID environment variable missing."
-        logger.error(LAST_ERROR)
-        return False, LAST_ERROR
+        return False
         
     url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
     try:
@@ -39,14 +37,8 @@ async def fetch_data_from_google_drive():
                 if resp.status == 200:
                     text_data = await resp.text()
                     clean_text = text_data.strip().replace("```json", "").replace("```", "")
+                    raw_data = json.loads(clean_text)
                     
-                    try:
-                        raw_data = json.loads(clean_text)
-                    except Exception as json_err:
-                        LAST_ERROR = f"JSON Parsing Error: {json_err}"
-                        logger.error(LAST_ERROR)
-                        return False, LAST_ERROR
-
                     direct_list, statement_list, twisted_list = [], [], []
 
                     if isinstance(raw_data, list):
@@ -59,23 +51,44 @@ async def fetch_data_from_google_drive():
                     PROCESSED_DATA["direct"] = direct_list
                     PROCESSED_DATA["statement"] = statement_list
                     PROCESSED_DATA["twisted"] = twisted_list
-                    
-                    total_count = len(direct_list) + len(statement_list) + len(twisted_list)
-                    if total_count == 0:
-                        LAST_ERROR = "Drive file fetched successfully, but 0 questions parsed from JSON keys."
-                        return False, LAST_ERROR
-                    
-                    LAST_ERROR = f"Success! Loaded {len(direct_list)} direct, {len(statement_list)} statement, {len(twisted_list)} twisted."
-                    logger.info(LAST_ERROR)
-                    return True, LAST_ERROR
-                else:
-                    LAST_ERROR = f"Drive HTTP Error Code: {resp.status}. Check link sharing permissions."
-                    logger.error(LAST_ERROR)
-                    return False, LAST_ERROR
+                    return True
+                return False
     except Exception as e:
-        LAST_ERROR = f"Drive Fetch Exception: {str(e)}"
-        logger.error(LAST_ERROR)
-        return False, LAST_ERROR
+        logger.error(f"Drive Exception: {e}")
+        return False
+
+async def generate_ai_question(mode: str):
+    """Google Gemini AI से डायनामिक प्रश्न जनरेट करने का फंक्शन"""
+    if not GEMINI_API_KEY:
+        return None
+
+    mode_prompts = {
+        "direct": "राजस्थान सामान्य ज्ञान (Rajasthan GK) का एक सीधा बहुविकल्पीय प्रश्न (MCQ) बनाएं।",
+        "statement": "राजस्थान सामान्य ज्ञान पर आधारित एक कठिन 'कथन (A) और कारण (R)' प्रकार का MCQ बनाएं।",
+        "twisted": "राजस्थान सामान्य ज्ञान पर आधारित एक घुमावदार, स्थिति-आधारित (Case-study type twisted) MCQ बनाएं।"
+    }
+
+    prompt = (
+        f"{mode_prompts.get(mode, 'Rajasthan GK MCQ')} "
+        f"Strictly return ONLY a valid JSON object without markdown syntax using this exact format:\n"
+        '{"question": "प्रश्न यहाँ", "options": ["विकल्प 1", "विकल्प 2", "विकल्प 3", "विकल्प 4"], "answer": 0}'
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+                    clean_text = raw_text.strip().replace("```json", "").replace("```", "").strip()
+                    return json.loads(clean_text)
+    except Exception as e:
+        logger.error(f"Gemini AI API Error: {e}")
+    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -91,23 +104,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted"),
-            InlineKeyboardButton("🔄 Drive Sync", callback_data="mode_sync")
-        ]
+            InlineKeyboardButton("🤖 AI अनलिमिटेड मोड", callback_data="mode_ai")
+        ],
+        [InlineKeyboardButton("🔄 Drive Sync", callback_data="mode_sync")]
     ]
     
     msg = "🧠 **Quiz Bot Ready!**\n\nनीचे दिए गए बटन पर क्लिक करके खेलना शुरू करें:"
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def debug_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = (
-        f"🛠 **Debug Report:**\n\n"
-        f"• **DRIVE_FILE_ID:** `{DRIVE_FILE_ID}`\n"
-        f"• **Direct Questions:** {len(PROCESSED_DATA['direct'])}\n"
-        f"• **Statement Questions:** {len(PROCESSED_DATA['statement'])}\n"
-        f"• **Twisted Questions:** {len(PROCESSED_DATA['twisted'])}\n\n"
-        f"• **Last Log:** `{LAST_ERROR}`"
-    )
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -125,34 +128,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🎯 डायरेक्ट मोड", callback_data="mode_direct"),
                 InlineKeyboardButton("📝 कथन-कारण मोड", callback_data="mode_statement")
             ],
-            [InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted")]
+            [
+                InlineKeyboardButton("🔄 घुमावदार (Twisted)", callback_data="mode_twisted"),
+                InlineKeyboardButton("🤖 AI अनलिमिटेड मोड", callback_data="mode_ai")
+            ]
         ]
         return await query.message.reply_text("🧹 **हिस्ट्री रीसेट हो गई है!** नया मोड चुनें:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     if query.data == "mode_sync":
-        success, err_msg = await fetch_data_from_google_drive()
+        success = await fetch_data_from_google_drive()
         USER_ASKED_IDS[user_id] = {"direct": set(), "statement": set(), "twisted": set()}
         if success:
-            return await query.message.reply_text(f"✅ **Google Drive से नया डेटा सिंक हो गया!**\n\n`{err_msg}`", parse_mode="Markdown")
+            return await query.message.reply_text("✅ **Google Drive से नया डेटा सिंक हो गया!**")
         else:
-            return await query.message.reply_text(f"❌ **Drive Sync एरर:**\n\n`{err_msg}`", parse_mode="Markdown")
+            return await query.message.reply_text("❌ Drive Sync फेल हो गया। Permissions चेक करें।")
 
-    mode_map = {"mode_direct": "direct", "mode_statement": "statement", "mode_twisted": "twisted"}
+    mode_map = {
+        "mode_direct": "direct", 
+        "mode_statement": "statement", 
+        "mode_twisted": "twisted",
+        "mode_ai": "ai"
+    }
     selected_mode = mode_map.get(query.data)
     if selected_mode:
         await start_quiz_session(query.message.chat_id, user_id, context, mode=selected_mode)
 
 async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    if mode == "ai":
+        # AI Mode logic
+        ai_question = await generate_ai_question("twisted")
+        if ai_question:
+            context.application.user_data[user_id] = {
+                "quiz": [ai_question],
+                "idx": 0,
+                "score": 0,
+                "total": 1,
+                "busy": True,
+                "is_ai": True
+            }
+            return await send_next_quiz(context, chat_id, user_id)
+        else:
+            return await context.bot.send_message(chat_id, "⚠️ AI से प्रश्न जनरेट नहीं हो सका। कृपया GEMINI_API_KEY की जाँच करें।")
+
     bank = PROCESSED_DATA.get(mode, [])
     
     if not bank:
-        success, err_msg = await fetch_data_from_google_drive()
+        await fetch_data_from_google_drive()
         bank = PROCESSED_DATA.get(mode, [])
-        if not bank:
+
+    if not bank:
+        # Fallback to AI if Drive file fails
+        ai_q = await generate_ai_question(mode)
+        if ai_q:
+            bank = [ai_q]
+        else:
+            keyboard = [[InlineKeyboardButton("🔄 Drive Sync", callback_data="mode_sync")]]
             return await context.bot.send_message(
-                chat_id, 
-                f"❌ **डेटा लोडिंग एरर:**\n\n`{err_msg}`\n\nकृपया Google Drive फाईल लिंक/Permission चेक करें या `/debug` कमांड भेजें।",
-                parse_mode="Markdown"
+                chat_id,
+                "❌ **Google Drive से डेटा लोड नहीं हो सका!**\n\nकृपया ड्राइव फ़ाइल का एक्सेस 'Anyone with the link' पर सेट करें और री-सिंक करें:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
     if user_id not in USER_ASKED_IDS:
@@ -182,7 +216,8 @@ async def start_quiz_session(chat_id: int, user_id: int, context: ContextTypes.D
         "idx": 0,
         "score": 0,
         "total": len(session_questions),
-        "busy": True
+        "busy": True,
+        "is_ai": False
     }
 
     await send_next_quiz(context, chat_id, user_id)
@@ -205,7 +240,10 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
                 InlineKeyboardButton("📝 Statement Mode", callback_data="mode_statement"),
                 InlineKeyboardButton("🔄 Twisted Mode", callback_data="mode_twisted")
             ],
-            [InlineKeyboardButton("🎯 Direct Mode", callback_data="mode_direct")]
+            [
+                InlineKeyboardButton("🎯 Direct Mode", callback_data="mode_direct"),
+                InlineKeyboardButton("🤖 AI मोड", callback_data="mode_ai")
+            ]
         ]
         res = f"🎉 **क्विज़ समाप्त!**\n\n✅ सही: {score}/{total}\n📊 स्कोर: {per}%"
         await context.bot.send_message(chat_id, res, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -253,7 +291,6 @@ async def main():
 
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("reset", start))
-    ptb_app.add_handler(CommandHandler("debug", debug_status))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(PollAnswerHandler(handle_poll_answer))
 
